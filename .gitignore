@@ -1,0 +1,8 @@
+# Ignorar secretos y basura local
+.streamlit/secrets.toml
+.env
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
