@@ -1,6 +1,6 @@
 """
-ZASEVA — Centro de Inteligencia Hídrica (Corredor Poniente)
-Fase A: textos legibles, semáforos en español, vista piperos, clic pozo ↔ mapa.
+ZASEVA — Centro de Inteligencia Hídrica (CDMX)
+Fase A + ampliación CDMX: textos legibles, vista piperos, dropdown de colonias.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-      .block-container { padding-top: 1.1rem; }
+      .block-container { padding-top: 1.05rem; }
       h1, h2, h3 { font-family: Georgia, serif; color: #0b3c4d; }
       div[data-testid="stMetricValue"] { color: #0b3c4d; }
       .hint { color: #4a5c63; font-size: 0.92rem; }
@@ -66,71 +66,41 @@ def load_csv(name: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def try_load_supabase_table(table: str) -> pd.DataFrame | None:
-    try:
-        url = st.secrets.get("SUPABASE_DB_URL")
-    except Exception:
-        url = None
-    if not url:
-        return None
-    try:
-        from sqlalchemy import create_engine
+@st.cache_data
+def load_colonias_geo() -> pd.DataFrame:
+    """Devuelve geojson como records mínimos vía geopandas si existe; si no, vacío."""
+    path = DATA_DIR / "colonias_cdmx_simplificado.geojson"
+    if not path.exists():
+        return pd.DataFrame()
+    import geopandas as gpd
 
-        engine = create_engine(url)
-        return pd.read_sql(f"SELECT * FROM zaseva.{table}", engine)
-    except Exception as exc:  # noqa: BLE001
-        st.warning(f"No pude leer Supabase ({table}): {exc}")
-        return None
+    gdf = gpd.read_file(path)
+    return gdf
 
 
-def prepare_oferta(raw: pd.DataFrame) -> pd.DataFrame:
-    df = raw.copy()
-    if "CLV_ACUI" in df.columns:
-        df = df.rename(
-            columns={
-                "CLV_ACUI": "cve_acui",
-                "NOM_ACUI": "nom_acui",
-                "NOM_EDO": "nom_edo",
-                "RECARGA_TO": "recarga_to_hm3",
-                "DESCARGA_N": "descarga_n_hm3",
-                "DMA_NEGATI": "dma_negati_hm3",
-            }
-        )
-    if "cve_acui" in df.columns:
-        df["cve_acui"] = df["cve_acui"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(4)
-    if "deficit_hm3" not in df.columns and "dma_negati_hm3" in df.columns:
-        df["deficit_hm3"] = df["dma_negati_hm3"].astype(float).abs()
-    df["estatus"] = df["dma_negati_hm3"].astype(float).apply(
-        lambda x: "🔴 En déficit" if x < 0 else "🟢 Con disponibilidad"
-    )
-    return df
-
-
-def prepare_piezo(raw: pd.DataFrame) -> pd.DataFrame:
-    df = raw.copy()
-    if "cve_acui" in df.columns:
-        df["cve_acui"] = df["cve_acui"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(4)
-    if "en_bbox_piloto" in df.columns:
-        df = df[df["en_bbox_piloto"] == True].copy()  # noqa: E712
-    if "n_obs" in df.columns:
-        df = df[df["n_obs"] >= 2].copy()
-    if "tasa_abatimiento_m_anio" in df.columns:
-        df = df[df["tasa_abatimiento_m_anio"].notna()].copy()
-    df["semaforo"] = df.get("nivel_estres", pd.Series(dtype=str)).map(semaforo_piezo)
-    df["consejo_para_piperos"] = df.get("nivel_estres", pd.Series(dtype=str)).map(consejo_pipero)
-    df["num_pozo"] = df["num_pozo"].astype(int)
-    return df.reset_index(drop=True)
+def prepare_piezo(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "cve_acui" in out.columns:
+        out["cve_acui"] = out["cve_acui"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(4)
+    out["semaforo"] = out.get("nivel_estres", pd.Series(dtype=str)).map(semaforo_piezo)
+    out["consejo_para_piperos"] = out.get("nivel_estres", pd.Series(dtype=str)).map(consejo_pipero)
+    out["num_pozo"] = out["num_pozo"].astype(int)
+    if "en_poniente" in out.columns:
+        out["en_poniente"] = out["en_poniente"].astype(str).str.lower().isin(["true", "1", "yes"])
+    return out
 
 
 def main() -> None:
     st.title("ZASEVA")
-    st.subheader("Centro de Inteligencia Hídrica — Corredor Poniente")
+    st.subheader("Centro de Inteligencia Hídrica — Ciudad de México")
     st.markdown(
         """
         <p class="hint">
-        Esta pantalla muestra <b>riesgo de agua</b> en Cuajimalpa, Álvaro Obregón y Huixquilucan
-        con datos oficiales (CONAGUA / REPDA). Aún <b>no</b> incluye tiempos reales de carga de pipas
-        (eso vendrá con la operación ZASEVA).
+        Mapa de <b>riesgo hídrico</b> con datos oficiales (CONAGUA / REPDA) para CDMX.
+        Puedes filtrar al <b>Corredor Poniente</b> o buscar por <b>colonia</b>.
+        Aún no incluye tiempos reales de carga de pipas (vendrán con la operación ZASEVA).
         </p>
         """,
         unsafe_allow_html=True,
@@ -139,114 +109,201 @@ def main() -> None:
     with st.expander("¿Qué estoy viendo? (guía rápida)", expanded=False):
         st.markdown(
             """
-            - **Déficit de acuíferos:** el subsuelo está en números rojos (se saca más de lo que se recarga).
-            - **Semáforo de pozos:** qué tan rápido baja el nivel del agua en puntos de medición.
-            - **REPDA:** agua **autorizada legalmente** (no siempre igual a lo que se bombea hoy).
-            - **Para piperos:** guía práctica de zonas a preferir o evitar, con lo que sabemos hoy.
+            - **Déficit de acuíferos:** el subsuelo en números rojos.
+            - **Semáforo de pozos:** qué tan rápido baja el nivel del agua.
+            - **REPDA:** agua autorizada legalmente (no bombeo en vivo).
+            - **Colonia:** busca un barrio (ej. Polanco, Santa Fe) para ver su contexto.
+            - **Para piperos:** guía de zonas preferibles vs a evitar (proxy de estrés, no tanque lleno).
             """
         )
 
-    # ---- Datos ----
-    oferta = try_load_supabase_table("v_oferta_acuifero")
-    if oferta is None or oferta.empty:
+    # ---- Datos CDMX ----
+    oferta = load_csv("oferta_acuiferos_cdmx.csv")
+    if oferta.empty:
         oferta = load_csv("oferta_acuiferos_poniente.csv")
-    oferta = prepare_oferta(oferta)
+        if "CLV_ACUI" in oferta.columns:
+            oferta = oferta.rename(
+                columns={
+                    "CLV_ACUI": "cve_acui",
+                    "NOM_ACUI": "nom_acui",
+                    "NOM_EDO": "nom_edo",
+                    "RECARGA_TO": "recarga_to_hm3",
+                    "DMA_NEGATI": "dma_negati_hm3",
+                }
+            )
+            oferta["deficit_hm3"] = oferta["dma_negati_hm3"].abs()
 
-    piezo_raw = try_load_supabase_table("v_heatmap_piezometria")
-    if piezo_raw is None or piezo_raw.empty:
-        piezo_raw = load_csv("estres_piezometrico_poniente.csv")
-    piezo = prepare_piezo(piezo_raw)
+    piezo = prepare_piezo(load_csv("estres_piezometrico_cdmx.csv"))
+    if piezo.empty:
+        piezo = prepare_piezo(load_csv("estres_piezometrico_poniente.csv"))
 
-    repda = try_load_supabase_table("v_repda_poniente")
-    if repda is None or repda.empty:
+    repda = load_csv("oferta_repda_cdmx.csv")
+    if repda.empty:
         repda = load_csv("oferta_repda_poniente.csv")
 
-    titles = load_csv("oferta_repda_poniente_titulos.csv")
-    sequia = load_csv("riesgo_sequia_poniente.csv")
+    titles = load_csv("oferta_repda_cdmx_titulos.csv")
+    if titles.empty:
+        titles = load_csv("oferta_repda_poniente_titulos.csv")
 
-    # ---- KPIs ----
-    deficit = float(oferta["deficit_hm3"].sum()) if len(oferta) else 0.0
-    repda_hm3 = (
-        float(titles["volumen_hm3_anio"].sum())
-        if len(titles) and "volumen_hm3_anio" in titles.columns
-        else 0.0
-    )
-    n_titles = len(titles) if len(titles) else 0
-    piezo_critico = int(piezo["nivel_estres"].eq("ALTO").sum()) if len(piezo) else 0
+    sequia = load_csv("riesgo_sequia_cdmx.csv")
+    if sequia.empty:
+        sequia = load_csv("riesgo_sequia_poniente.csv")
+
+    colonias = load_csv("colonias_cdmx.csv")
+    colonias_geo = load_colonias_geo()
+
+    # ---- Filtros ----
+    f1, f2, f3 = st.columns([1, 1, 1.4])
+    with f1:
+        ambito = st.selectbox(
+            "Ámbito geográfico",
+            ["Toda la CDMX", "Corredor Poniente"],
+            help="Poniente = Cuajimalpa, Álvaro Obregón, Miguel Hidalgo y Magdalena Contreras.",
+        )
+    # filtrar catálogo
+    col_cat = colonias.copy()
+    pie = piezo.copy()
+    rep = repda.copy()
+    if ambito == "Corredor Poniente":
+        if "en_poniente" in col_cat.columns:
+            col_cat = col_cat[col_cat["en_poniente"] == True]  # noqa: E712
+        if "en_poniente" in pie.columns:
+            pie = pie[pie["en_poniente"] == True]  # noqa: E712
+        if "en_poniente" in rep.columns:
+            rep = rep[rep["en_poniente"] == True]  # noqa: E712
+        elif "en_bbox_piloto" in pie.columns:
+            pie = pie[pie["en_bbox_piloto"] == True]  # noqa: E712
+
+    with f2:
+        alcaldias = ["(Todas las alcaldías)"] + sorted(col_cat["alcaldia"].dropna().unique().tolist()) if len(col_cat) else ["(Todas las alcaldías)"]
+        alcaldia = st.selectbox("Alcaldía", alcaldias)
+    if alcaldia != "(Todas las alcaldías)":
+        col_cat = col_cat[col_cat["alcaldia"] == alcaldia]
+        if "alcaldia" in pie.columns:
+            pie = pie[pie["alcaldia"] == alcaldia]
+        if "alcaldia" in rep.columns:
+            rep = rep[rep["alcaldia"] == alcaldia]
+
+    with f3:
+        labels = ["(Buscar colonia…)"] + sorted(col_cat["label"].dropna().unique().tolist()) if len(col_cat) else ["(Buscar colonia…)"]
+        colonia_label = st.selectbox(
+            "Colonia",
+            labels,
+            help="Escribe para filtrar. Ejemplo: Polanco — Miguel Hidalgo",
+        )
+
+    colonia_sel = None
+    if colonia_label != "(Buscar colonia…)" and len(col_cat):
+        hit = col_cat[col_cat["label"] == colonia_label]
+        if len(hit):
+            colonia_sel = hit.iloc[0]
+            # filtrar puntos a esa colonia
+            if "label" in pie.columns:
+                pie = pie[pie["label"] == colonia_label]
+            if "label" in rep.columns:
+                rep = rep[rep["label"] == colonia_label]
+            st.info(
+                f"**Colonia seleccionada:** {colonia_sel['colonia']} "
+                f"({colonia_sel['alcaldia']}). "
+                f"Pozos de medición: {len(pie)} · Concesiones REPDA: {rep['titulo'].nunique() if 'titulo' in rep.columns else len(rep)}"
+            )
+
+    # ---- KPIs (sobre filtro actual de puntos; déficit de acuíferos sigue siendo CDMX) ----
+    deficit = float(oferta["deficit_hm3"].sum()) if len(oferta) and "deficit_hm3" in oferta.columns else 0.0
+    if len(titles):
+        tfilt = titles.copy()
+        if ambito == "Corredor Poniente" and "en_poniente" in tfilt.columns:
+            tfilt = tfilt[tfilt["en_poniente"] == True]  # noqa: E712
+        if alcaldia != "(Todas las alcaldías)" and "alcaldia" in tfilt.columns:
+            tfilt = tfilt[tfilt["alcaldia"] == alcaldia]
+        if colonia_sel is not None and "colonia" in tfilt.columns:
+            tfilt = tfilt[tfilt["colonia"] == colonia_sel["colonia"]]
+        repda_hm3 = float(tfilt["volumen_hm3_anio"].sum()) if "volumen_hm3_anio" in tfilt.columns else 0.0
+        n_titles = len(tfilt)
+    else:
+        repda_hm3, n_titles = 0.0, 0
+    piezo_critico = int(pie["nivel_estres"].eq("ALTO").sum()) if len(pie) and "nivel_estres" in pie.columns else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Déficit de acuíferos", f"{deficit:,.0f} hm³/año", help="Agua que 'falta' al año en los acuíferos del piloto.")
-    c2.metric("Agua concesionada (REPDA)", f"{repda_hm3:,.1f} hm³/año", help="Volumen autorizado en títulos, no bombeo medido en vivo.")
-    c3.metric("Pozos en semáforo crítico", f"{piezo_critico}", help="Puntos donde el nivel baja más rápido.")
-    c4.metric("Títulos REPDA en el piloto", f"{n_titles}", help="Cantidad de concesiones distintas en la zona.")
+    c1.metric("Déficit acuíferos (CDMX)", f"{deficit:,.0f} hm³/año", help="Suma de déficit de acuíferos que tocan la ciudad.")
+    c2.metric("Agua concesionada (filtro)", f"{repda_hm3:,.1f} hm³/año", help="Según el filtro actual (ámbito/alcaldía/colonia).")
+    c3.metric("Pozos críticos (filtro)", f"{piezo_critico}")
+    c4.metric("Títulos REPDA (filtro)", f"{n_titles}")
 
     st.divider()
 
-    # ---- Selector de pozo (tabla → mapa) ----
+    # ---- Selector pozo ----
     if "pozo_sel" not in st.session_state:
         st.session_state.pozo_sel = None
 
-    pozo_opts = ["(Ver todo el mapa)"] + [
-        f"{int(r.num_pozo)} · {r.semaforo} · {r.consejo_para_piperos}"
-        for r in piezo.sort_values("tasa_abatimiento_m_anio", ascending=False).itertuples()
+    pie_series = pie[pie["n_obs"] >= 2] if "n_obs" in pie.columns else pie
+    pie_series = pie_series[pie_series["tasa_abatimiento_m_anio"].notna()] if "tasa_abatimiento_m_anio" in pie_series.columns else pie_series
+    pozo_opts = ["(Ver mapa del filtro actual)"] + [
+        f"{int(r.num_pozo)} · {r.semaforo} · {getattr(r, 'colonia', '')}"
+        for r in pie_series.sort_values("tasa_abatimiento_m_anio", ascending=False).itertuples()
     ]
-    sel = st.selectbox(
-        "🔎 Buscar / enfocar un pozo en el mapa",
-        options=pozo_opts,
-        help="Elige un número de pozo para centrar el mapa ahí. También puedes usar las tablas de abajo.",
-    )
-    if sel and sel != "(Ver todo el mapa)":
+    sel = st.selectbox("🔎 Enfocar un pozo de medición", pozo_opts)
+    if sel and sel != "(Ver mapa del filtro actual)":
         st.session_state.pozo_sel = int(sel.split("·")[0].strip())
-    else:
-        st.session_state.pozo_sel = None
+    elif colonia_sel is None:
+        # no forzar clear if colonia drives view
+        pass
 
-    # ---- Mapa + panel derecho ----
     left, right = st.columns([1.65, 1], gap="large")
 
     with left:
-        st.markdown("### Mapa del Corredor Poniente")
-        st.caption(
-            "Puntos de color = medición de nivel (estrés). Anillos = concesiones REPDA. "
-            "Haz clic en un punto del mapa para ver detalle."
-        )
+        st.markdown("### Mapa")
+        st.caption("Color = estrés del nivel freático. Anillos = concesiones REPDA. El polígono aparece si eliges una colonia.")
 
-        pmap = piezo.copy()
-        # colores por semáforo
+        layers = []
+        # colonia polygon
+        if colonia_sel is not None and len(colonias_geo):
+            poly = colonias_geo[colonias_geo["label"] == colonia_sel["label"]]
+            if len(poly):
+                layers.append(
+                    pdk.Layer(
+                        "GeoJsonLayer",
+                        data=poly.__geo_interface__,
+                        stroked=True,
+                        filled=True,
+                        get_fill_color="[11, 60, 77, 40]",
+                        get_line_color="[11, 60, 77, 220]",
+                        line_width_min_pixels=2,
+                    )
+                )
+
+        pmap = pie_series.copy() if len(pie_series) else pie.copy()
         color_map = {
             "ALTO": [196, 92, 38, 210],
             "MEDIO": [212, 160, 23, 200],
             "LEVE": [61, 124, 71, 190],
             "RECUPERACION_O_ESTABLE": [31, 122, 108, 190],
         }
-        pmap["fill_color"] = pmap["nivel_estres"].map(
-            lambda x: color_map.get(str(x).upper(), [120, 120, 120, 160])
-        )
-        pmap["radius"] = 90
-        if st.session_state.pozo_sel is not None:
-            pmap.loc[pmap["num_pozo"] == st.session_state.pozo_sel, "radius"] = 220
-
-        layers = [
-            pdk.Layer(
-                "ScatterplotLayer",
-                data=pmap,
-                id="piezo",
-                get_position="[longitud, latitud]",
-                get_radius="radius",
-                get_fill_color="fill_color",
-                pickable=True,
-                auto_highlight=True,
+        if len(pmap):
+            pmap["fill_color"] = pmap["nivel_estres"].map(
+                lambda x: color_map.get(str(x).upper(), [120, 120, 120, 160])
             )
-        ]
-
-        if {"latitud", "longitud"}.issubset(repda.columns):
-            rmap = repda.dropna(subset=["latitud", "longitud"]).copy()
-            vol_col = (
-                "volumen_punto_m3_anio"
-                if "volumen_punto_m3_anio" in rmap.columns
-                else "volumen_m3_anio"
+            pmap["radius"] = 90
+            if st.session_state.pozo_sel is not None:
+                pmap.loc[pmap["num_pozo"] == st.session_state.pozo_sel, "radius"] = 220
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=pmap,
+                    id="piezo",
+                    get_position="[longitud, latitud]",
+                    get_radius="radius",
+                    get_fill_color="fill_color",
+                    pickable=True,
+                    auto_highlight=True,
+                )
             )
-            vmax = max(float(rmap[vol_col].max()), 1.0) if vol_col in rmap.columns else 1.0
-            rmap["radius"] = 35 + 160 * (rmap[vol_col] / vmax) ** 0.5 if vol_col in rmap.columns else 50
+
+        if len(rep) and {"latitud", "longitud"}.issubset(rep.columns):
+            rmap = rep.dropna(subset=["latitud", "longitud"]).copy()
+            vol_col = "volumen_punto_m3_anio" if "volumen_punto_m3_anio" in rmap.columns else "volumen_m3_anio"
+            vmax = max(float(rmap[vol_col].max()), 1.0) if vol_col in rmap.columns and len(rmap) else 1.0
+            rmap["radius"] = 30 + 140 * (rmap[vol_col] / vmax) ** 0.5 if vol_col in rmap.columns else 45
             layers.append(
                 pdk.Layer(
                     "ScatterplotLayer",
@@ -256,23 +313,26 @@ def main() -> None:
                     get_radius="radius",
                     stroked=True,
                     filled=False,
-                    get_line_color="[11, 60, 77, 180]",
+                    get_line_color="[11, 60, 77, 170]",
                     line_width_min_pixels=1,
                     pickable=True,
                 )
             )
 
-        # vista centrada en pozo seleccionado
-        if st.session_state.pozo_sel is not None:
+        # view
+        if st.session_state.pozo_sel is not None and len(pmap) and (pmap["num_pozo"] == st.session_state.pozo_sel).any():
             row = pmap[pmap["num_pozo"] == st.session_state.pozo_sel].iloc[0]
+            view = pdk.ViewState(latitude=float(row.latitud), longitude=float(row.longitud), zoom=13.5)
+        elif colonia_sel is not None:
             view = pdk.ViewState(
-                latitude=float(row["latitud"]),
-                longitude=float(row["longitud"]),
+                latitude=float(colonia_sel["latitud_centro"]),
+                longitude=float(colonia_sel["longitud_centro"]),
                 zoom=13.2,
-                pitch=0,
             )
+        elif ambito == "Corredor Poniente":
+            view = pdk.ViewState(latitude=19.35, longitude=-99.28, zoom=11)
         else:
-            view = pdk.ViewState(latitude=19.35, longitude=-99.28, zoom=10.6, pitch=0)
+            view = pdk.ViewState(latitude=19.36, longitude=-99.15, zoom=10.2)
 
         event = st.pydeck_chart(
             pdk.Deck(
@@ -280,45 +340,35 @@ def main() -> None:
                 initial_view_state=view,
                 map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
                 tooltip={
-                    "html": "<b>Pozo {num_pozo}</b><br/>{semaforo}<br/>Bajada: {tasa_abatimiento_m_anio} m/año<br/>{consejo_para_piperos}",
+                    "html": "<b>Pozo {num_pozo}</b><br/>{colonia}<br/>{semaforo}<br/>{consejo_para_piperos}",
                     "style": {"backgroundColor": "#0b3c4d", "color": "white"},
                 },
             ),
             use_container_width=True,
-            height=520,
+            height=540,
             on_select="rerun",
             selection_mode="single-object",
-            key="mapa_piloto",
+            key="mapa_cdmx",
         )
-
-        # mapa → selección de pozo
         try:
             objects = event.selection.get("objects", {}) if event and event.selection else {}
-            piezo_hits = objects.get("piezo") or objects.get("ScatterplotLayer") or []
-            if piezo_hits:
-                hit = piezo_hits[0]
-                if "num_pozo" in hit:
-                    st.session_state.pozo_sel = int(hit["num_pozo"])
-                    st.info(
-                        f"Seleccionado en mapa: **pozo {st.session_state.pozo_sel}** · "
-                        f"{hit.get('semaforo', '')} · {hit.get('consejo_para_piperos', '')}"
-                    )
+            hits = objects.get("piezo") or []
+            if hits and "num_pozo" in hits[0]:
+                st.session_state.pozo_sel = int(hits[0]["num_pozo"])
         except Exception:
             pass
 
-        if st.session_state.pozo_sel is not None:
+        if st.session_state.pozo_sel is not None and len(pmap):
             det = pmap[pmap["num_pozo"] == st.session_state.pozo_sel]
             if len(det):
                 d = det.iloc[0]
                 st.success(
-                    f"**Pozo {int(d['num_pozo'])}** · {d['semaforo']} · "
-                    f"Bajada del nivel: **{d['tasa_abatimiento_m_anio']:.2f} m/año** · "
-                    f"{d['consejo_para_piperos']}"
+                    f"**Pozo {int(d['num_pozo'])}** · {d.get('colonia', '')} ({d.get('alcaldia', '')}) · "
+                    f"{d['semaforo']} · Bajada: **{d['tasa_abatimiento_m_anio']:.2f} m/año** · {d['consejo_para_piperos']}"
                 )
 
     with right:
-        st.markdown("### Acuíferos (oferta de agua)")
-        st.caption("Un acuífero es el ‘depósito’ subterráneo. Déficit = números rojos.")
+        st.markdown("### Acuíferos que tocan CDMX")
         oferta_view = pd.DataFrame(
             {
                 "Clave acuífero": oferta.get("cve_acui"),
@@ -326,158 +376,174 @@ def main() -> None:
                 "Entidad": oferta.get("nom_edo"),
                 "Recarga (hm³/año)": oferta.get("recarga_to_hm3"),
                 "Déficit (hm³/año)": oferta.get("deficit_hm3"),
-                "Estatus": oferta.get("estatus"),
             }
         )
         st.dataframe(oferta_view, use_container_width=True, hide_index=True)
 
-        st.markdown("### Sequía oficial (municipios)")
+        st.markdown("### Sequía oficial por alcaldía")
         if len(sequia):
             sequia_view = pd.DataFrame(
                 {
-                    "Municipio": sequia.get("nombre_mun"),
-                    "Entidad": sequia.get("entidad"),
+                    "Alcaldía / municipio": sequia.get("nombre_mun"),
                     "Semáforo sequía": sequia.get("sps"),
                     "Reducción pedida": sequia.get("ahorro_uso_eficiente"),
                 }
             )
-            st.dataframe(sequia_view, use_container_width=True, hide_index=True)
-            st.caption("Si dice SIN SEQUÍA pero el acuífero está en déficit, el problema es estructural.")
+            st.dataframe(sequia_view, use_container_width=True, hide_index=True, height=260)
         else:
             st.info("Sin datos de sequía.")
 
-        st.markdown("### Agua concesionada por uso (REPDA)")
-        if len(titles) and "uso" in titles.columns:
-            uso = (
-                titles.groupby("uso", dropna=False)["volumen_hm3_anio"]
-                .sum()
-                .sort_values(ascending=False)
-                .reset_index()
-                .rename(columns={"uso": "Uso del agua", "volumen_hm3_anio": "hm³ autorizados / año"})
-            )
-            st.bar_chart(uso, x="Uso del agua", y="hm³ autorizados / año", horizontal=True)
+        st.markdown("### Concesiones por uso (filtro actual)")
+        if len(titles):
+            tfilt = titles.copy()
+            if ambito == "Corredor Poniente" and "en_poniente" in tfilt.columns:
+                tfilt = tfilt[tfilt["en_poniente"] == True]  # noqa: E712
+            if alcaldia != "(Todas las alcaldías)" and "alcaldia" in tfilt.columns:
+                tfilt = tfilt[tfilt["alcaldia"] == alcaldia]
+            if colonia_sel is not None and "colonia" in tfilt.columns:
+                tfilt = tfilt[tfilt["colonia"] == colonia_sel["colonia"]]
+            if len(tfilt):
+                uso = (
+                    tfilt.groupby("uso", dropna=False)["volumen_hm3_anio"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .reset_index()
+                    .rename(columns={"uso": "Uso del agua", "volumen_hm3_anio": "hm³ / año"})
+                )
+                st.bar_chart(uso, x="Uso del agua", y="hm³ / año", horizontal=True)
 
     st.divider()
+    st.markdown("### Para piperos — guía del filtro actual")
+    st.caption("Proxy de estrés del nivel freático (no es medidor de tanque lleno en vivo).")
 
-    # ---- Vista piperos ----
-    st.markdown("### Para piperos — ¿dónde conviene más?")
-    st.caption(
-        "Esto NO es un medidor de ‘tanque lleno’ en vivo. Es una guía de estrés del nivel freático: "
-        "dónde el agua subterránea baja más rápido (evitar) vs más estable (preferible)."
-    )
-
-    preferir = piezo[piezo["nivel_estres"].isin(["RECUPERACION_O_ESTABLE", "LEVE"])].sort_values(
+    preferir = pie_series[pie_series["nivel_estres"].isin(["RECUPERACION_O_ESTABLE", "LEVE"])].sort_values(
         "tasa_abatimiento_m_anio"
-    )
-    evitar = piezo[piezo["nivel_estres"] == "ALTO"].sort_values(
+    ) if len(pie_series) else pie.head(0)
+    evitar = pie_series[pie_series["nivel_estres"] == "ALTO"].sort_values(
         "tasa_abatimiento_m_anio", ascending=False
-    )
+    ) if len(pie_series) else pie.head(0)
 
     col_a, col_b = st.columns(2)
     with col_a:
-        st.markdown("#### ✅ Zonas / pozos más preferibles")
-        pref_view = preferir.head(8)[
-            ["num_pozo", "semaforo", "tasa_abatimiento_m_anio", "consejo_para_piperos", "latitud", "longitud"]
-        ].rename(
-            columns={
-                "num_pozo": "No. pozo",
-                "semaforo": "Semáforo",
-                "tasa_abatimiento_m_anio": "Bajada del nivel (m/año)",
-                "consejo_para_piperos": "Consejo",
-                "latitud": "Latitud",
-                "longitud": "Longitud",
-            }
-        )
-        st.dataframe(pref_view, use_container_width=True, hide_index=True)
+        st.markdown("#### ✅ Más preferibles")
         if len(preferir):
+            st.dataframe(
+                preferir.head(8)[["num_pozo", "colonia", "alcaldia", "semaforo", "tasa_abatimiento_m_anio", "consejo_para_piperos"]].rename(
+                    columns={
+                        "num_pozo": "No. pozo",
+                        "colonia": "Colonia",
+                        "alcaldia": "Alcaldía",
+                        "semaforo": "Semáforo",
+                        "tasa_abatimiento_m_anio": "Bajada (m/año)",
+                        "consejo_para_piperos": "Consejo",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
             best = preferir.iloc[0]
-            if st.button(f"Enfocar en mapa el pozo {int(best['num_pozo'])} (mejor de la lista)", key="btn_best"):
+            if st.button(f"Enfocar pozo {int(best['num_pozo'])}", key="btn_best"):
                 st.session_state.pozo_sel = int(best["num_pozo"])
                 st.rerun()
+        else:
+            st.write("No hay pozos ‘preferibles’ en este filtro.")
 
     with col_b:
-        st.markdown("#### ⛔ Zonas / pozos a evitar (más críticos)")
-        evit_view = evitar.head(8)[
-            ["num_pozo", "semaforo", "tasa_abatimiento_m_anio", "consejo_para_piperos", "latitud", "longitud"]
-        ].rename(
-            columns={
-                "num_pozo": "No. pozo",
-                "semaforo": "Semáforo",
-                "tasa_abatimiento_m_anio": "Bajada del nivel (m/año)",
-                "consejo_para_piperos": "Consejo",
-                "latitud": "Latitud",
-                "longitud": "Longitud",
-            }
-        )
-        st.dataframe(evit_view, use_container_width=True, hide_index=True)
+        st.markdown("#### ⛔ Más críticos")
         if len(evitar):
+            st.dataframe(
+                evitar.head(8)[["num_pozo", "colonia", "alcaldia", "semaforo", "tasa_abatimiento_m_anio", "consejo_para_piperos"]].rename(
+                    columns={
+                        "num_pozo": "No. pozo",
+                        "colonia": "Colonia",
+                        "alcaldia": "Alcaldía",
+                        "semaforo": "Semáforo",
+                        "tasa_abatimiento_m_anio": "Bajada (m/año)",
+                        "consejo_para_piperos": "Consejo",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
             worst = evitar.iloc[0]
-            if st.button(f"Enfocar en mapa el pozo {int(worst['num_pozo'])} (más crítico)", key="btn_worst"):
+            if st.button(f"Enfocar pozo {int(worst['num_pozo'])}", key="btn_worst"):
                 st.session_state.pozo_sel = int(worst["num_pozo"])
                 st.rerun()
+        else:
+            st.write("No hay pozos críticos en este filtro.")
 
     st.divider()
-    t1, t2 = st.tabs(["Lista completa de pozos (legible)", "Mayores títulos REPDA"])
-
+    t1, t2 = st.tabs(["Pozos del filtro", "Títulos REPDA del filtro"])
     with t1:
-        st.caption("Selecciona una fila para enfocar ese pozo en el mapa.")
-        full = piezo.sort_values("tasa_abatimiento_m_anio", ascending=False).copy()
-        full_view = full[
-            ["num_pozo", "semaforo", "tasa_abatimiento_m_anio", "pne_ultimo_m", "consejo_para_piperos", "cve_acui", "latitud", "longitud"]
-        ].rename(
-            columns={
-                "num_pozo": "No. pozo",
-                "semaforo": "Semáforo",
-                "tasa_abatimiento_m_anio": "Bajada del nivel (m/año)",
-                "pne_ultimo_m": "Profundidad última medida (m)",
-                "consejo_para_piperos": "Consejo para piperos",
-                "cve_acui": "Clave acuífero",
-                "latitud": "Latitud",
-                "longitud": "Longitud",
-            }
-        )
-        selected = st.dataframe(
-            full_view,
-            use_container_width=True,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key="tabla_pozos",
-        )
-        try:
-            rows = selected.selection.rows if selected and selected.selection else []
-            if rows:
-                idx = rows[0]
-                st.session_state.pozo_sel = int(full.iloc[idx]["num_pozo"])
-                st.write(f"Pozo enfocado: **{st.session_state.pozo_sel}** (mira el mapa arriba).")
-        except Exception:
-            pass
-
-    with t2:
-        src = titles if len(titles) else repda.drop_duplicates("titulo")
-        if len(src) and "volumen_m3_anio" in src.columns:
-            top = src.sort_values("volumen_m3_anio", ascending=False).head(10)
-            top_view = pd.DataFrame(
-                {
-                    "Título / concesión": top.get("titulo"),
-                    "Uso del agua": top.get("uso"),
-                    "Volumen autorizado (m³/año)": top.get("volumen_m3_anio"),
-                    "Titular": top.get("titular"),
+        if len(pie_series):
+            full = pie_series.sort_values("tasa_abatimiento_m_anio", ascending=False)
+            full_view = full[
+                ["num_pozo", "colonia", "alcaldia", "semaforo", "tasa_abatimiento_m_anio", "consejo_para_piperos", "latitud", "longitud"]
+            ].rename(
+                columns={
+                    "num_pozo": "No. pozo",
+                    "colonia": "Colonia",
+                    "alcaldia": "Alcaldía",
+                    "semaforo": "Semáforo",
+                    "tasa_abatimiento_m_anio": "Bajada del nivel (m/año)",
+                    "consejo_para_piperos": "Consejo",
+                    "latitud": "Latitud",
+                    "longitud": "Longitud",
                 }
             )
-            st.dataframe(top_view, use_container_width=True, hide_index=True)
-            st.caption("REPDA = derecho legal de usar agua. No garantiza disponibilidad física inmediata.")
-
-    with st.expander("Estado técnico de conexión"):
-        has_db = False
-        try:
-            has_db = bool(st.secrets.get("SUPABASE_DB_URL"))
-        except Exception:
-            has_db = False
-        if has_db:
-            st.success("Conectado a Supabase (secret SUPABASE_DB_URL detectado).")
+            selected = st.dataframe(
+                full_view,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="tabla_pozos_cdmx",
+            )
+            try:
+                rows = selected.selection.rows if selected and selected.selection else []
+                if rows:
+                    st.session_state.pozo_sel = int(full.iloc[rows[0]]["num_pozo"])
+            except Exception:
+                pass
         else:
-            st.info("Usando archivos CSV del proyecto. Supabase se conectará cuando pongamos el Secret.")
+            st.write("Sin pozos para este filtro.")
+
+    with t2:
+        if len(titles):
+            tfilt = titles.copy()
+            if ambito == "Corredor Poniente" and "en_poniente" in tfilt.columns:
+                tfilt = tfilt[tfilt["en_poniente"] == True]  # noqa: E712
+            if alcaldia != "(Todas las alcaldías)" and "alcaldia" in tfilt.columns:
+                tfilt = tfilt[tfilt["alcaldia"] == alcaldia]
+            if colonia_sel is not None and "colonia" in tfilt.columns:
+                tfilt = tfilt[tfilt["colonia"] == colonia_sel["colonia"]]
+            top = tfilt.sort_values("volumen_m3_anio", ascending=False).head(15)
+            st.dataframe(
+                pd.DataFrame(
+                    {
+                        "Título": top.get("titulo"),
+                        "Colonia": top.get("colonia"),
+                        "Alcaldía": top.get("alcaldia"),
+                        "Uso": top.get("uso"),
+                        "Volumen autorizado (m³/año)": top.get("volumen_m3_anio"),
+                        "Titular": top.get("titular"),
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.write("Sin títulos para este filtro.")
+
+    with st.expander("Notas y límites de esta versión"):
+        st.markdown(
+            """
+            - **CDMX completa** en catálogo de colonias y concesiones/puntos disponibles.
+            - El semáforo de pozo es un **proxy** (bajada del nivel), no litros disponibles hoy.
+            - Si una colonia no tiene pozo de medición cerca, verás pocas filas: usa alcaldía o Toda CDMX.
+            - Huixquilucan (Edomex) no está en “Toda la CDMX”; el foco poniente CDMX cubre Cuajimalpa/AO/Miguel Hidalgo/Magdalena Contreras.
+            """
+        )
 
 
 if __name__ == "__main__":
