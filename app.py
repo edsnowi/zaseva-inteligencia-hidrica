@@ -153,14 +153,13 @@ def main() -> None:
     colonias_geo = load_colonias_geo()
 
     # ---- Filtros ----
-    f1, f2, f3 = st.columns([1, 1, 1.4])
-    with f1:
-        ambito = st.selectbox(
-            "Ámbito geográfico",
-            ["Toda la CDMX", "Corredor Poniente"],
-            help="Poniente = Cuajimalpa, Álvaro Obregón, Miguel Hidalgo y Magdalena Contreras.",
-        )
-    # filtrar catálogo
+    ambito = st.selectbox(
+        "Ámbito geográfico",
+        ["Toda la CDMX", "Corredor Poniente"],
+        help="Poniente = Cuajimalpa, Álvaro Obregón, Miguel Hidalgo y Magdalena Contreras.",
+    )
+
+    # catálogo base por ámbito
     col_cat = colonias.copy()
     pie = piezo.copy()
     rep = repda.copy()
@@ -174,39 +173,92 @@ def main() -> None:
         elif "en_bbox_piloto" in pie.columns:
             pie = pie[pie["en_bbox_piloto"] == True]  # noqa: E712
 
-    with f2:
-        alcaldias = ["(Todas las alcaldías)"] + sorted(col_cat["alcaldia"].dropna().unique().tolist()) if len(col_cat) else ["(Todas las alcaldías)"]
-        alcaldia = st.selectbox("Alcaldía", alcaldias)
-    if alcaldia != "(Todas las alcaldías)":
-        col_cat = col_cat[col_cat["alcaldia"] == alcaldia]
+    st.caption(
+        "En México a estos barrios se les dice **colonias** (también hay fraccionamientos, pueblos o unidades habitacionales). "
+        "En esta app usamos **Colonia** porque es el nombre más común y el que entiende casi todo el mundo."
+    )
+
+    alc_all = sorted(col_cat["alcaldia"].dropna().unique().tolist()) if len(col_cat) else []
+    c_alc, c_col = st.columns(2)
+
+    with c_alc:
+        st.markdown("#### Alcaldías")
+        alc_todo = st.checkbox("Seleccionar todas las alcaldías", value=True, key="alc_todo")
+        seleccion_alcaldias: list[str] = []
+        if alc_todo:
+            seleccion_alcaldias = alc_all
+            st.caption(f"Todas seleccionadas ({len(alc_all)})")
+        else:
+            # casillas por alcaldía (son pocas: ~16)
+            for a in alc_all:
+                if st.checkbox(a, value=False, key=f"alc_{a}"):
+                    seleccion_alcaldias.append(a)
+            if not seleccion_alcaldias:
+                st.warning("Elige al menos una alcaldía (o marca “todas”).")
+
+    # acotar colonias a alcaldías elegidas
+    if seleccion_alcaldias:
+        col_cat = col_cat[col_cat["alcaldia"].isin(seleccion_alcaldias)]
         if "alcaldia" in pie.columns:
-            pie = pie[pie["alcaldia"] == alcaldia]
+            pie = pie[pie["alcaldia"].isin(seleccion_alcaldias)]
         if "alcaldia" in rep.columns:
-            rep = rep[rep["alcaldia"] == alcaldia]
+            rep = rep[rep["alcaldia"].isin(seleccion_alcaldias)]
 
-    with f3:
-        labels = ["(Buscar colonia…)"] + sorted(col_cat["label"].dropna().unique().tolist()) if len(col_cat) else ["(Buscar colonia…)"]
-        colonia_label = st.selectbox(
-            "Colonia",
-            labels,
-            help="Escribe para filtrar. Ejemplo: Polanco — Miguel Hidalgo",
+    with c_col:
+        st.markdown("#### Colonias")
+        col_labels = sorted(col_cat["label"].dropna().unique().tolist()) if len(col_cat) else []
+        col_todo = st.checkbox(
+            "Seleccionar todas las colonias",
+            value=True,
+            key="col_todo",
+            help="Si desmarcas, aparecen casillas/lista para elegir una o varias.",
         )
+        seleccion_colonias: list[str] = []
+        if col_todo:
+            seleccion_colonias = col_labels
+            st.caption(f"Todas las colonias del filtro ({len(col_labels)})")
+        else:
+            # Si hay demasiadas, pedimos acotar por alcaldía; si ya está acotado, casillas en scroll
+            if len(seleccion_alcaldias) != 1 and len(col_labels) > 120:
+                st.info(
+                    "Hay muchas colonias. Elige **una sola alcaldía** a la izquierda "
+                    "para ver casillas manejables, o usa la búsqueda de abajo."
+                )
+                seleccion_colonias = st.multiselect(
+                    "Buscar y marcar colonias",
+                    options=col_labels,
+                    default=[],
+                    placeholder="Escribe el nombre, ej. Polanco…",
+                )
+            else:
+                # casillas en contenedor scrolleable
+                busqueda = st.text_input("Filtrar lista de colonias", placeholder="Ej. Polanco, Santa Fe…")
+                visibles = col_labels
+                if busqueda.strip():
+                    q = busqueda.strip().lower()
+                    visibles = [x for x in col_labels if q in x.lower()]
+                st.caption(f"Mostrando {len(visibles)} de {len(col_labels)} · marca las que quieras")
+                box = st.container(height=280)
+                with box:
+                    for lab in visibles:
+                        if st.checkbox(lab, value=False, key=f"col_{lab}"):
+                            seleccion_colonias.append(lab)
+            if not seleccion_colonias:
+                st.warning("Elige al menos una colonia (o marca “todas”).")
 
-    colonia_sel = None
-    if colonia_label != "(Buscar colonia…)" and len(col_cat):
-        hit = col_cat[col_cat["label"] == colonia_label]
-        if len(hit):
-            colonia_sel = hit.iloc[0]
-            # filtrar puntos a esa colonia
-            if "label" in pie.columns:
-                pie = pie[pie["label"] == colonia_label]
-            if "label" in rep.columns:
-                rep = rep[rep["label"] == colonia_label]
-            st.info(
-                f"**Colonia seleccionada:** {colonia_sel['colonia']} "
-                f"({colonia_sel['alcaldia']}). "
-                f"Pozos de medición: {len(pie)} · Concesiones REPDA: {rep['titulo'].nunique() if 'titulo' in rep.columns else len(rep)}"
-            )
+    # aplicar filtro de colonias (si no es "todas" del catálogo completo del ámbito+alcaldía)
+    colonia_sel_rows = col_cat.copy()
+    filtro_colonias_activo = (not col_todo) and bool(seleccion_colonias)
+    if filtro_colonias_activo:
+        colonia_sel_rows = col_cat[col_cat["label"].isin(seleccion_colonias)]
+        if "label" in pie.columns:
+            pie = pie[pie["label"].isin(seleccion_colonias)]
+        if "label" in rep.columns:
+            rep = rep[rep["label"].isin(seleccion_colonias)]
+        st.info(
+            f"**Filtro activo:** {len(seleccion_alcaldias)} alcaldía(s) · {len(seleccion_colonias)} colonia(s). "
+            f"Pozos: {len(pie)} · Concesiones: {rep['titulo'].nunique() if 'titulo' in rep.columns and len(rep) else len(rep)}"
+        )
 
     # ---- KPIs (sobre filtro actual de puntos; déficit de acuíferos sigue siendo CDMX) ----
     deficit = float(oferta["deficit_hm3"].sum()) if len(oferta) and "deficit_hm3" in oferta.columns else 0.0
@@ -214,10 +266,13 @@ def main() -> None:
         tfilt = titles.copy()
         if ambito == "Corredor Poniente" and "en_poniente" in tfilt.columns:
             tfilt = tfilt[tfilt["en_poniente"] == True]  # noqa: E712
-        if alcaldia != "(Todas las alcaldías)" and "alcaldia" in tfilt.columns:
-            tfilt = tfilt[tfilt["alcaldia"] == alcaldia]
-        if colonia_sel is not None and "colonia" in tfilt.columns:
-            tfilt = tfilt[tfilt["colonia"] == colonia_sel["colonia"]]
+        if seleccion_alcaldias and "alcaldia" in tfilt.columns:
+            tfilt = tfilt[tfilt["alcaldia"].isin(seleccion_alcaldias)]
+        if filtro_colonias_activo and "label" in tfilt.columns:
+            tfilt = tfilt[tfilt["label"].isin(seleccion_colonias)]
+        elif filtro_colonias_activo and "colonia" in tfilt.columns:
+            nombres = colonia_sel_rows["colonia"].unique().tolist()
+            tfilt = tfilt[tfilt["colonia"].isin(nombres)]
         repda_hm3 = float(tfilt["volumen_hm3_anio"].sum()) if "volumen_hm3_anio" in tfilt.columns else 0.0
         n_titles = len(tfilt)
     else:
@@ -245,20 +300,18 @@ def main() -> None:
     sel = st.selectbox("🔎 Enfocar un pozo de medición", pozo_opts)
     if sel and sel != "(Ver mapa del filtro actual)":
         st.session_state.pozo_sel = int(sel.split("·")[0].strip())
-    elif colonia_sel is None:
-        # no forzar clear if colonia drives view
-        pass
 
     left, right = st.columns([1.65, 1], gap="large")
 
     with left:
         st.markdown("### Mapa")
-        st.caption("Color = estrés del nivel freático. Anillos = concesiones REPDA. El polígono aparece si eliges una colonia.")
+        st.caption("Color = estrés del nivel freático. Anillos = concesiones REPDA. El polígono aparece si marcas colonias específicas.")
 
         layers = []
-        # colonia polygon
-        if colonia_sel is not None and len(colonias_geo):
-            poly = colonias_geo[colonias_geo["label"] == colonia_sel["label"]]
+        # polígonos de colonias seleccionadas (máx 40 para no saturar)
+        if filtro_colonias_activo and len(colonias_geo) and len(seleccion_colonias):
+            labs = seleccion_colonias[:40]
+            poly = colonias_geo[colonias_geo["label"].isin(labs)]
             if len(poly):
                 layers.append(
                     pdk.Layer(
@@ -323,11 +376,11 @@ def main() -> None:
         if st.session_state.pozo_sel is not None and len(pmap) and (pmap["num_pozo"] == st.session_state.pozo_sel).any():
             row = pmap[pmap["num_pozo"] == st.session_state.pozo_sel].iloc[0]
             view = pdk.ViewState(latitude=float(row.latitud), longitude=float(row.longitud), zoom=13.5)
-        elif colonia_sel is not None:
+        elif filtro_colonias_activo and len(colonia_sel_rows):
             view = pdk.ViewState(
-                latitude=float(colonia_sel["latitud_centro"]),
-                longitude=float(colonia_sel["longitud_centro"]),
-                zoom=13.2,
+                latitude=float(colonia_sel_rows["latitud_centro"].mean()),
+                longitude=float(colonia_sel_rows["longitud_centro"].mean()),
+                zoom=12.5 if len(seleccion_colonias) <= 3 else 11.5,
             )
         elif ambito == "Corredor Poniente":
             view = pdk.ViewState(latitude=19.35, longitude=-99.28, zoom=11)
@@ -398,10 +451,10 @@ def main() -> None:
             tfilt = titles.copy()
             if ambito == "Corredor Poniente" and "en_poniente" in tfilt.columns:
                 tfilt = tfilt[tfilt["en_poniente"] == True]  # noqa: E712
-            if alcaldia != "(Todas las alcaldías)" and "alcaldia" in tfilt.columns:
-                tfilt = tfilt[tfilt["alcaldia"] == alcaldia]
-            if colonia_sel is not None and "colonia" in tfilt.columns:
-                tfilt = tfilt[tfilt["colonia"] == colonia_sel["colonia"]]
+            if seleccion_alcaldias and "alcaldia" in tfilt.columns:
+                tfilt = tfilt[tfilt["alcaldia"].isin(seleccion_alcaldias)]
+            if filtro_colonias_activo and "colonia" in tfilt.columns:
+                tfilt = tfilt[tfilt["colonia"].isin(colonia_sel_rows["colonia"].unique())]
             if len(tfilt):
                 uso = (
                     tfilt.groupby("uso", dropna=False)["volumen_hm3_anio"]
@@ -513,10 +566,10 @@ def main() -> None:
             tfilt = titles.copy()
             if ambito == "Corredor Poniente" and "en_poniente" in tfilt.columns:
                 tfilt = tfilt[tfilt["en_poniente"] == True]  # noqa: E712
-            if alcaldia != "(Todas las alcaldías)" and "alcaldia" in tfilt.columns:
-                tfilt = tfilt[tfilt["alcaldia"] == alcaldia]
-            if colonia_sel is not None and "colonia" in tfilt.columns:
-                tfilt = tfilt[tfilt["colonia"] == colonia_sel["colonia"]]
+            if seleccion_alcaldias and "alcaldia" in tfilt.columns:
+                tfilt = tfilt[tfilt["alcaldia"].isin(seleccion_alcaldias)]
+            if filtro_colonias_activo and "colonia" in tfilt.columns:
+                tfilt = tfilt[tfilt["colonia"].isin(colonia_sel_rows["colonia"].unique())]
             top = tfilt.sort_values("volumen_m3_anio", ascending=False).head(15)
             st.dataframe(
                 pd.DataFrame(
