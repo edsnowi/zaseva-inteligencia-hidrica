@@ -281,7 +281,7 @@ def init_ee(project: str | None = None) -> Any:
 
 def fetch_sentinel1_patch(
     days_back: int = 20,
-    scale_m: int = 40,
+    scale_m: int = 60,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """
     Descarga mediana VV/VH (potencia lineal) del AOI en los últimos `days_back` días.
@@ -291,7 +291,7 @@ def fetch_sentinel1_patch(
 
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days_back)
-    region = ee.Geometry.Rectangle([AOI_SW[0], AOI_SW[1], AOI_NE[0], AOI_NE[1]])
+    region = ee.Geometry.Rectangle([AOI_SW[0], AOI_SW[1], AOI_NE[0], AOI_NE[1]], proj="EPSG:4326", geodesic=False)
 
     collection = (
         ee.ImageCollection("COPERNICUS/S1_GRD")
@@ -303,52 +303,57 @@ def fetch_sentinel1_patch(
         .select(["VV", "VH"])
     )
 
-    n = collection.size().getInfo()
+    n = int(collection.size().getInfo())
     log.info("Escenas Sentinel-1 en ventana %s→%s: %s", start, end, n)
     if n == 0:
         raise RuntimeError("Sin escenas Sentinel-1 en la ventana/AOI. Amplía --days.")
 
-    # S1_GRD ya viene en dB; convertir a lineal para Lee, luego volver a dB
-    def db_to_linear(img: Any) -> Any:
-        return ee.Image(10).pow(img.divide(10)).copyProperties(img, ["system:time_start"])
+    # S1_GRD viene en dB. Mediana temporal + filtro focal (speckle ligero en servidor).
+    median_db = ee.Image(collection.median()).clip(region)
+    median_db = median_db.focal_median(radius=45, units="meters").select(["VV", "VH"])
 
-    median_db = collection.median().clip(region)
-    median_lin = db_to_linear(median_db)
+    # dB → potencia lineal: 10^(dB/10)
+    median_lin = ee.Image(10).pow(median_db.divide(10)).rename(["VV", "VH"])
 
-    # Sample as numpy via getDownloadURL / computePixels — usamos sampleRectangle-like
-    # vía reduceResolution + array; aquí: ee.data.computePixels si disponible,
-    # fallback getInfo sobre rejilla.
-    info = median_lin.getInfo()
-    _ = info  # schema check
+    # Rejilla acotada para no saturar la API
+    ncols = int(np.clip((AOI_NE[0] - AOI_SW[0]) * 111_320 / scale_m, 32, 180))
+    nrows = int(np.clip((AOI_NE[1] - AOI_SW[1]) * 110_540 / scale_m, 32, 180))
+    xres = (AOI_NE[0] - AOI_SW[0]) / ncols
+    yres = (AOI_NE[1] - AOI_SW[1]) / nrows
 
-    # Rejilla regular en el cliente (robusto en Supabase/CI)
-    xres = (AOI_NE[0] - AOI_SW[0]) / max(int((AOI_NE[0] - AOI_SW[0]) * 111_320 / scale_m), 32)
-    yres = (AOI_NE[1] - AOI_SW[1]) / max(int((AOI_NE[1] - AOI_SW[1]) * 110_540 / scale_m), 32)
-    xs = np.arange(AOI_SW[0] + xres / 2, AOI_NE[0], xres)
-    ys = np.arange(AOI_NE[1] - yres / 2, AOI_SW[1], -yres)
+    request = {
+        "expression": median_lin,
+        "fileFormat": "NUMPY_NDARRAY",
+        "grid": {
+            "dimensions": {"width": ncols, "height": nrows},
+            "affineTransform": {
+                "scaleX": xres,
+                "shearX": 0,
+                "translateX": AOI_SW[0],
+                "shearY": 0,
+                "scaleY": -yres,
+                "translateY": AOI_NE[1],
+            },
+            "crsCode": "EPSG:4326",
+        },
+    }
 
-    points = [ee.Geometry.Point([float(x), float(y)]) for x in xs for y in ys]
-    # Muestreo por lotes para no saturar
-    batch = 500
-    vv_vals: list[float] = []
-    vh_vals: list[float] = []
-    coords: list[tuple[float, float]] = [(float(x), float(y)) for y in ys for x in xs]
-
-    for i in range(0, len(points), batch):
-        fc = ee.FeatureCollection(
-            [ee.Feature(points[j], {"i": j}) for j in range(i, min(i + batch, len(points)))]
-        )
-        sampled = median_lin.sampleRegions(collection=fc, scale=scale_m, geometries=False)
-        rows = sampled.getInfo()["features"]
-        by_i = {int(f["properties"]["i"]): f["properties"] for f in rows}
-        for j in range(i, min(i + batch, len(points))):
-            props = by_i.get(j, {})
-            vv_vals.append(float(props.get("VV", np.nan)))
-            vh_vals.append(float(props.get("VH", np.nan)))
-
-    ncols, nrows = len(xs), len(ys)
-    vv = np.array(vv_vals, dtype=np.float64).reshape(nrows, ncols)
-    vh = np.array(vh_vals, dtype=np.float64).reshape(nrows, ncols)
+    try:
+        arr = ee.data.computePixels(request)
+        # Structured array con bandas VV/VH
+        if getattr(arr.dtype, "names", None):
+            vv = np.asarray(arr["VV"], dtype=np.float64)
+            vh = np.asarray(arr["VH"], dtype=np.float64)
+        else:
+            # Fallback: última dimensión = bandas
+            data = np.asarray(arr, dtype=np.float64)
+            if data.ndim == 3 and data.shape[-1] >= 2:
+                vv, vh = data[:, :, 0], data[:, :, 1]
+            else:
+                raise RuntimeError(f"Formato inesperado de computePixels: shape={getattr(data, 'shape', None)}")
+    except Exception as exc:
+        log.warning("computePixels falló (%s). Usando muestreo por puntos...", exc)
+        vv, vh = _sample_s1_by_points(ee, median_lin, ncols, nrows, xres, yres, scale_m)
 
     meta = {
         "fecha_inicio_ventana": start.isoformat(),
@@ -360,6 +365,45 @@ def fetch_sentinel1_patch(
         "coords_shape": (nrows, ncols),
     }
     return vv, vh, meta
+
+
+def _sample_s1_by_points(
+    ee: Any,
+    image: Any,
+    ncols: int,
+    nrows: int,
+    xres: float,
+    yres: float,
+    scale_m: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fallback: muestreo puntual en rejilla (más lento, pero compatible)."""
+    img = ee.Image(image)
+    xs = AOI_SW[0] + (np.arange(ncols) + 0.5) * xres
+    ys = AOI_NE[1] - (np.arange(nrows) + 0.5) * yres
+    vv = np.full((nrows, ncols), np.nan, dtype=np.float64)
+    vh = np.full((nrows, ncols), np.nan, dtype=np.float64)
+
+    coords: list[tuple[int, int, float, float]] = []
+    for r, y in enumerate(ys):
+        for c, x in enumerate(xs):
+            coords.append((r, c, float(x), float(y)))
+
+    batch = 400
+    for i in range(0, len(coords), batch):
+        chunk = coords[i : i + batch]
+        fc = ee.FeatureCollection(
+            [ee.Feature(ee.Geometry.Point([x, y]), {"r": r, "c": c}) for r, c, x, y in chunk]
+        )
+        sampled = img.sampleRegions(collection=fc, scale=scale_m, geometries=False)
+        for f in sampled.getInfo().get("features", []):
+            props = f.get("properties", {})
+            r = int(props["r"])
+            c = int(props["c"])
+            vv[r, c] = float(props.get("VV", np.nan))
+            vh[r, c] = float(props.get("VH", np.nan))
+        log.info("Muestreo SAR %s/%s", min(i + batch, len(coords)), len(coords))
+
+    return vv, vh
 
 
 def dry_run_synthetic_anomalies(rng: np.random.Generator | None = None) -> gpd.GeoDataFrame:
