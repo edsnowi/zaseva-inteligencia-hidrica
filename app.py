@@ -1,10 +1,12 @@
 """
 ZASEVA — Centro de Inteligencia Hídrica (CDMX)
 Fase A + ampliación CDMX: textos legibles, vista piperos, dropdown de colonias.
+Lee CSV locales y, si hay SUPABASE_DB_URL, también vistas PostGIS (SAR / diagnóstico).
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -58,7 +60,19 @@ def consejo_pipero(nivel: str) -> str:
     return "Dato insuficiente"
 
 
-@st.cache_data
+def get_db_url() -> str | None:
+    """URI de Supabase desde Secrets (Cloud) o variable de entorno (local)."""
+    try:
+        url = st.secrets.get("SUPABASE_DB_URL")  # type: ignore[attr-defined]
+        if url:
+            return str(url).strip()
+    except Exception:
+        pass
+    url = os.environ.get("SUPABASE_DB_URL")
+    return url.strip() if url else None
+
+
+@st.cache_data(ttl=300)
 def load_csv(name: str) -> pd.DataFrame:
     path = DATA_DIR / name
     if not path.exists():
@@ -66,7 +80,23 @@ def load_csv(name: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-@st.cache_data
+@st.cache_data(ttl=300)
+def load_sql(query: str) -> pd.DataFrame:
+    """Lee una consulta SQL desde Supabase. Vacío si no hay URL o falla."""
+    url = get_db_url()
+    if not url:
+        return pd.DataFrame()
+    try:
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(url)
+        with engine.connect() as conn:
+            return pd.read_sql(text(query), conn)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
 def load_colonias_geo() -> pd.DataFrame:
     """Devuelve geojson como records mínimos vía geopandas si existe; si no, vacío."""
     path = DATA_DIR / "colonias_cdmx_simplificado.geojson"
@@ -92,15 +122,142 @@ def prepare_piezo(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def load_dashboard_layers() -> dict:
+    """
+    Carga capas del dashboard.
+    Preferencia: PostGIS (si hay secret) → CSV local como respaldo.
+    """
+    fuente = "CSV local"
+    db_ok = bool(get_db_url())
+
+    oferta = load_sql(
+        "SELECT cve_acui, nom_acui, nom_edo, recarga_hm3 AS recarga_to_hm3, deficit_hm3 "
+        "FROM zaseva.acuiferos_conagua"
+    )
+    if oferta.empty:
+        oferta = load_sql(
+            "SELECT cve_acui, nom_acui, nom_edo, recarga_to_hm3, deficit_hm3 "
+            "FROM zaseva.v_oferta_acuifero"
+        )
+    if oferta.empty:
+        oferta = load_csv("oferta_acuiferos_cdmx.csv")
+        if oferta.empty:
+            oferta = load_csv("oferta_acuiferos_poniente.csv")
+            if "CLV_ACUI" in oferta.columns:
+                oferta = oferta.rename(
+                    columns={
+                        "CLV_ACUI": "cve_acui",
+                        "NOM_ACUI": "nom_acui",
+                        "NOM_EDO": "nom_edo",
+                        "RECARGA_TO": "recarga_to_hm3",
+                        "DMA_NEGATI": "dma_negati_hm3",
+                    }
+                )
+                oferta["deficit_hm3"] = oferta["dma_negati_hm3"].abs()
+
+    piezo = load_sql(
+        """
+        SELECT num_pozo, nom_pozo, cve_acui, nom_acui AS nom_acuif,
+               latitud, longitud, tasa_abatimiento_m_anio, pne_ultimo_m,
+               nivel_estres, en_bbox_piloto,
+               COALESCE(en_bbox_piloto, FALSE) AS en_poniente,
+               2 AS n_obs
+        FROM zaseva.pozos_piezometricos
+        """
+    )
+    if piezo.empty:
+        piezo = load_sql(
+            """
+            SELECT num_pozo, nom_pozo, cve_acui, nom_acuif, latitud, longitud,
+                   tasa_abatimiento_m_anio, pne_ultimo_m, n_obs, nivel_estres,
+                   en_bbox_piloto, en_bbox_piloto AS en_poniente
+            FROM zaseva.v_heatmap_piezometria
+            """
+        )
+    if piezo.empty:
+        piezo = load_csv("estres_piezometrico_cdmx.csv")
+        if piezo.empty:
+            piezo = load_csv("estres_piezometrico_poniente.csv")
+
+    repda = load_sql(
+        """
+        SELECT titulo, titular, uso, volumen_m3_anio, volumen_hm3_anio,
+               volumen_punto_m3_anio, volumen_punto_hm3_anio,
+               latitud, longitud, cve_acui, nom_acui, en_bbox_piloto,
+               en_bbox_piloto AS en_poniente
+        FROM zaseva.v_repda_poniente
+        """
+    )
+    if repda.empty:
+        repda = load_csv("oferta_repda_cdmx.csv")
+        if repda.empty:
+            repda = load_csv("oferta_repda_poniente.csv")
+
+    titles = load_csv("oferta_repda_cdmx_titulos.csv")
+    if titles.empty:
+        titles = load_csv("oferta_repda_poniente_titulos.csv")
+
+    sequia = load_csv("riesgo_sequia_cdmx.csv")
+    if sequia.empty:
+        sequia = load_csv("riesgo_sequia_poniente.csv")
+
+    sar = load_sql(
+        """
+        SELECT anomalia_id, fecha_escena, polarizacion, backscatter_db, delta_db,
+               humedad_anomala, cve_acui, latitud, longitud, dist_pozo_critico_m
+        FROM zaseva.anomalias_satelitales_sar
+        WHERE humedad_anomala = TRUE
+        ORDER BY fecha_escena DESC
+        LIMIT 5000
+        """
+    )
+    diagnostico = load_sql(
+        """
+        SELECT alcaldia, puntos_criticos_fugas, deficit_acuifero_hm3_promedio,
+               score_severidad_promedio, score_severidad_max, nivel_riesgo_estructural, n_colonias
+        FROM zaseva.vista_diagnostico_alcaldia_resumen
+        ORDER BY score_severidad_max DESC NULLS LAST
+        """
+    )
+    salud = load_sql(
+        """
+        SELECT colonia, alcaldia, cve_acui, score_severidad_fuga, nivel_riesgo_red,
+               score_sar_humedad, score_abatimiento, deficit_acui_hm3,
+               latitud, longitud, fecha_calculo
+        FROM zaseva.mapa_salud_red_correlacionado
+        ORDER BY score_severidad_fuga DESC
+        LIMIT 3000
+        """
+    )
+
+    if db_ok and (not sar.empty or not diagnostico.empty or not salud.empty or not oferta.empty):
+        fuente = "Supabase + CSV"
+    elif db_ok:
+        fuente = "CSV local (Supabase configurado, sin filas SAR aún)"
+
+    return {
+        "oferta": oferta,
+        "piezo": prepare_piezo(piezo),
+        "repda": repda,
+        "titles": titles,
+        "sequia": sequia,
+        "sar": sar,
+        "diagnostico": diagnostico,
+        "salud": salud,
+        "fuente": fuente,
+        "db_ok": db_ok,
+    }
+
+
 def main() -> None:
     st.title("ZASEVA")
     st.subheader("Centro de Inteligencia Hídrica — Ciudad de México")
     st.markdown(
         """
         <p class="hint">
-        Mapa de <b>riesgo hídrico</b> con datos oficiales (CONAGUA / REPDA) para CDMX.
+        Mapa de <b>riesgo hídrico</b> con datos oficiales (CONAGUA / REPDA) para CDMX,
+        más capa satelital Sentinel-1 (fugas invisibles / humedad anómala) cuando Supabase está conectado.
         Puedes filtrar al <b>Corredor Poniente</b> o buscar por <b>colonia</b>.
-        Aún no incluye tiempos reales de carga de pipas (vendrán con la operación ZASEVA).
         </p>
         """,
         unsafe_allow_html=True,
@@ -112,42 +269,32 @@ def main() -> None:
             - **Déficit de acuíferos:** el subsuelo en números rojos.
             - **Semáforo de pozos:** qué tan rápido baja el nivel del agua.
             - **REPDA:** agua autorizada legalmente (no bombeo en vivo).
-            - **Colonia:** busca un barrio (ej. Polanco, Santa Fe) para ver su contexto.
+            - **SAR / fugas invisibles:** humedad anómala detectada con radar Sentinel-1.
+            - **Score de severidad:** cruce satélite + pozos + déficit (0–100) para plática B2G.
             - **Para piperos:** guía de zonas preferibles vs a evitar (proxy de estrés, no tanque lleno).
             """
         )
 
-    # ---- Datos CDMX ----
-    oferta = load_csv("oferta_acuiferos_cdmx.csv")
-    if oferta.empty:
-        oferta = load_csv("oferta_acuiferos_poniente.csv")
-        if "CLV_ACUI" in oferta.columns:
-            oferta = oferta.rename(
-                columns={
-                    "CLV_ACUI": "cve_acui",
-                    "NOM_ACUI": "nom_acui",
-                    "NOM_EDO": "nom_edo",
-                    "RECARGA_TO": "recarga_to_hm3",
-                    "DMA_NEGATI": "dma_negati_hm3",
-                }
-            )
-            oferta["deficit_hm3"] = oferta["dma_negati_hm3"].abs()
+    # ---- Datos (Supabase si hay secret; si no, CSV) ----
+    layers = load_dashboard_layers()
+    oferta = layers["oferta"]
+    piezo = layers["piezo"]
+    repda = layers["repda"]
+    titles = layers["titles"]
+    sequia = layers["sequia"]
+    sar = layers["sar"]
+    diagnostico = layers["diagnostico"]
+    salud = layers["salud"]
+    fuente = layers["fuente"]
+    db_ok = layers["db_ok"]
 
-    piezo = prepare_piezo(load_csv("estres_piezometrico_cdmx.csv"))
-    if piezo.empty:
-        piezo = prepare_piezo(load_csv("estres_piezometrico_poniente.csv"))
-
-    repda = load_csv("oferta_repda_cdmx.csv")
-    if repda.empty:
-        repda = load_csv("oferta_repda_poniente.csv")
-
-    titles = load_csv("oferta_repda_cdmx_titulos.csv")
-    if titles.empty:
-        titles = load_csv("oferta_repda_poniente_titulos.csv")
-
-    sequia = load_csv("riesgo_sequia_cdmx.csv")
-    if sequia.empty:
-        sequia = load_csv("riesgo_sequia_poniente.csv")
+    if db_ok:
+        st.caption(f"Fuente de datos: **{fuente}** · Supabase conectado.")
+    else:
+        st.caption(
+            "Fuente de datos: **CSV local**. "
+            "Para activar satélite/diagnóstico: configura `SUPABASE_DB_URL` en Streamlit Secrets."
+        )
 
     colonias = load_csv("colonias_cdmx.csv")
     colonias_geo = load_colonias_geo()
@@ -278,12 +425,21 @@ def main() -> None:
     else:
         repda_hm3, n_titles = 0.0, 0
     piezo_critico = int(pie["nivel_estres"].eq("ALTO").sum()) if len(pie) and "nivel_estres" in pie.columns else 0
+    sar_count = int(len(sar)) if len(sar) else 0
+    score_max = float(salud["score_severidad_fuga"].max()) if len(salud) and "score_severidad_fuga" in salud.columns else 0.0
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Déficit acuíferos (CDMX)", f"{deficit:,.0f} hm³/año", help="Suma de déficit de acuíferos que tocan la ciudad.")
     c2.metric("Agua concesionada (filtro)", f"{repda_hm3:,.1f} hm³/año", help="Según el filtro actual (ámbito/alcaldía/colonia).")
     c3.metric("Pozos críticos (filtro)", f"{piezo_critico}")
     c4.metric("Títulos REPDA (filtro)", f"{n_titles}")
+    c5.metric(
+        "Puntos SAR / humedad",
+        f"{sar_count}",
+        help="Anomalías Sentinel-1 (humedad anómala) cargadas desde Supabase.",
+    )
+    if score_max > 0:
+        st.caption(f"Score máximo de severidad de fuga en mapa salud: **{score_max:.0f}/100**")
 
     st.divider()
 
@@ -305,9 +461,13 @@ def main() -> None:
 
     with left:
         st.markdown("### Mapa")
-        st.caption("Color = estrés del nivel freático. Anillos = concesiones REPDA. El polígono aparece si marcas colonias específicas.")
+        st.caption(
+            "Color = estrés del nivel freático. Anillos = concesiones REPDA. "
+            "Puntos cyan = humedad anómala Sentinel-1. El polígono aparece si marcas colonias específicas."
+        )
 
         layers = []
+        mostrar_sar = st.checkbox("Mostrar anomalías SAR (fugas invisibles)", value=True, key="show_sar")
         # polígonos de colonias seleccionadas (máx 40 para no saturar)
         if filtro_colonias_activo and len(colonias_geo) and len(seleccion_colonias):
             labs = seleccion_colonias[:40]
@@ -368,6 +528,28 @@ def main() -> None:
                     filled=False,
                     get_line_color="[11, 60, 77, 170]",
                     line_width_min_pixels=1,
+                    pickable=True,
+                )
+            )
+
+        if mostrar_sar and len(sar) and {"latitud", "longitud"}.issubset(sar.columns):
+            smap = sar.dropna(subset=["latitud", "longitud"]).copy()
+            if ambito == "Corredor Poniente":
+                smap = smap[
+                    (smap["longitud"] >= -99.31)
+                    & (smap["longitud"] <= -99.15)
+                    & (smap["latitud"] >= 19.30)
+                    & (smap["latitud"] <= 19.45)
+                ]
+            smap["radius"] = 55
+            layers.append(
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=smap,
+                    id="sar",
+                    get_position="[longitud, latitud]",
+                    get_radius="radius",
+                    get_fill_color="[0, 160, 180, 170]",
                     pickable=True,
                 )
             )
@@ -464,6 +646,52 @@ def main() -> None:
                     .rename(columns={"uso": "Uso del agua", "volumen_hm3_anio": "hm³ / año"})
                 )
                 st.bar_chart(uso, x="Uso del agua", y="hm³ / año", horizontal=True)
+
+    st.divider()
+    st.markdown("### Diagnóstico B2G — alcaldías (Sentinel-1 × acuífero × pozos)")
+    st.caption(
+        "Vista para plática con municipios: fugas invisibles, déficit del acuífero y riesgo estructural de red. "
+        "Se alimenta de `vista_diagnostico_alcaldia_resumen` en Supabase."
+    )
+    if len(diagnostico):
+        diag_view = diagnostico.rename(
+            columns={
+                "alcaldia": "Alcaldía",
+                "puntos_criticos_fugas": "Puntos críticos fugas",
+                "deficit_acuifero_hm3_promedio": "Déficit acuífero (hm³)",
+                "score_severidad_promedio": "Score promedio",
+                "score_severidad_max": "Score máximo",
+                "nivel_riesgo_estructural": "Riesgo estructural",
+                "n_colonias": "Colonias",
+            }
+        )
+        st.dataframe(diag_view, use_container_width=True, hide_index=True)
+    elif db_ok:
+        st.info(
+            "Supabase está configurado, pero aún no hay filas en el diagnóstico SAR. "
+            "Corre el ETL satelital y recarga la app."
+        )
+    else:
+        st.info(
+            "Para ver este bloque: configura `SUPABASE_DB_URL` en Streamlit Secrets "
+            "y asegúrate de haber corrido el ETL SAR."
+        )
+
+    if len(salud):
+        with st.expander("Detalle de celdas con mayor score de severidad", expanded=False):
+            top = salud.head(25).rename(
+                columns={
+                    "colonia": "Colonia",
+                    "alcaldia": "Alcaldía",
+                    "score_severidad_fuga": "Score fuga",
+                    "nivel_riesgo_red": "Riesgo",
+                    "score_sar_humedad": "Score SAR",
+                    "score_abatimiento": "Score abatimiento",
+                    "deficit_acui_hm3": "Déficit hm³",
+                    "fecha_calculo": "Fecha",
+                }
+            )
+            st.dataframe(top, use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("### Para piperos — guía del filtro actual")
@@ -593,8 +821,10 @@ def main() -> None:
             """
             - **CDMX completa** en catálogo de colonias y concesiones/puntos disponibles.
             - El semáforo de pozo es un **proxy** (bajada del nivel), no litros disponibles hoy.
+            - La capa **SAR** es un proxy de humedad anómala (Sentinel-1), no una fuga confirmada en campo.
             - Si una colonia no tiene pozo de medición cerca, verás pocas filas: usa alcaldía o Toda CDMX.
             - Huixquilucan (Edomex) no está en “Toda la CDMX”; el foco poniente CDMX cubre Cuajimalpa/AO/Miguel Hidalgo/Magdalena Contreras.
+            - Streamlit Cloud necesita el secret `SUPABASE_DB_URL` para leer SAR y el diagnóstico B2G.
             """
         )
 
