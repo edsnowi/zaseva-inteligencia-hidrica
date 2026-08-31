@@ -517,8 +517,11 @@ def main() -> None:
     with left:
         st.markdown("### Mapa")
         st.caption(
-            "Color = estrés del nivel freático. Anillos = concesiones REPDA. "
-            "Puntos cyan = humedad anómala Sentinel-1. El polígono aparece si marcas colonias específicas."
+            "**Cómo leer el mapa:** "
+            "puntos de color (rojo/naranja/verde) = pozos piezométricos; "
+            "anillos = concesiones REPDA; "
+            "**puntos cyan = fugas invisibles (proxy)** = humedad anómala detectada por radar Sentinel-1. "
+            "No es una fuga confirmada en campo: es una señal satelital para priorizar inspección."
         )
 
         layers = []
@@ -554,6 +557,10 @@ def main() -> None:
             pmap["radius"] = 90
             if st.session_state.pozo_sel is not None:
                 pmap.loc[pmap["num_pozo"] == st.session_state.pozo_sel, "radius"] = 220
+            pmap["tip_titulo"] = pmap["num_pozo"].map(lambda x: f"Pozo {int(x)}")
+            pmap["tip_linea1"] = pmap.get("colonia", pd.Series([""] * len(pmap))).fillna("").astype(str)
+            pmap["tip_linea2"] = pmap.get("semaforo", pd.Series([""] * len(pmap))).fillna("").astype(str)
+            pmap["tip_linea3"] = pmap.get("consejo_para_piperos", pd.Series([""] * len(pmap))).fillna("").astype(str)
             layers.append(
                 pdk.Layer(
                     "ScatterplotLayer",
@@ -572,6 +579,13 @@ def main() -> None:
             vol_col = "volumen_punto_m3_anio" if "volumen_punto_m3_anio" in rmap.columns else "volumen_m3_anio"
             vmax = max(float(rmap[vol_col].max()), 1.0) if vol_col in rmap.columns and len(rmap) else 1.0
             rmap["radius"] = 30 + 140 * (rmap[vol_col] / vmax) ** 0.5 if vol_col in rmap.columns else 45
+            rmap["tip_titulo"] = "Concesión REPDA"
+            rmap["tip_linea1"] = rmap.get("titular", pd.Series([""] * len(rmap))).fillna("").astype(str)
+            rmap["tip_linea2"] = rmap.get("uso", pd.Series([""] * len(rmap))).fillna("").astype(str)
+            if vol_col in rmap.columns:
+                rmap["tip_linea3"] = rmap[vol_col].map(lambda v: f"Volumen punto: {v:,.0f} m³/año")
+            else:
+                rmap["tip_linea3"] = ""
             layers.append(
                 pdk.Layer(
                     "ScatterplotLayer",
@@ -597,6 +611,27 @@ def main() -> None:
                     & (smap["latitud"] <= 19.45)
                 ]
             smap["radius"] = 55
+            smap["tip_titulo"] = "Fuga invisible (proxy SAR)"
+            smap["tip_linea1"] = smap.apply(
+                lambda r: f"Fecha escena: {r['fecha_escena']}" if pd.notna(r.get("fecha_escena")) else "Sentinel-1",
+                axis=1,
+            )
+            smap["tip_linea2"] = smap.apply(
+                lambda r: (
+                    f"Backscatter: {float(r['backscatter_db']):.1f} dB · Δ {float(r['delta_db']):.1f} dB"
+                    if pd.notna(r.get("backscatter_db")) and pd.notna(r.get("delta_db"))
+                    else "Humedad anómala detectada"
+                ),
+                axis=1,
+            )
+            smap["tip_linea3"] = smap.apply(
+                lambda r: (
+                    f"Acuífero {r['cve_acui']} · dist. pozo crítico: {float(r['dist_pozo_critico_m']):.0f} m"
+                    if pd.notna(r.get("dist_pozo_critico_m"))
+                    else f"Acuífero {r.get('cve_acui', 's/d')} · señal dieléctrica anómala"
+                ),
+                axis=1,
+            )
             layers.append(
                 pdk.Layer(
                     "ScatterplotLayer",
@@ -630,7 +665,7 @@ def main() -> None:
                 initial_view_state=view,
                 map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
                 tooltip={
-                    "html": "<b>Pozo {num_pozo}</b><br/>{colonia}<br/>{semaforo}<br/>{consejo_para_piperos}",
+                    "html": "<b>{tip_titulo}</b><br/>{tip_linea1}<br/>{tip_linea2}<br/>{tip_linea3}",
                     "style": {"backgroundColor": "#0b3c4d", "color": "white"},
                 },
             ),
