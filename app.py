@@ -159,10 +159,38 @@ def prepare_piezo(df: pd.DataFrame) -> pd.DataFrame:
         out["cve_acui"] = out["cve_acui"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(4)
     out["semaforo"] = out.get("nivel_estres", pd.Series(dtype=str)).map(semaforo_piezo)
     out["consejo_para_piperos"] = out.get("nivel_estres", pd.Series(dtype=str)).map(consejo_pipero)
-    out["num_pozo"] = out["num_pozo"].astype(int)
+    if "num_pozo" in out.columns:
+        out["num_pozo"] = pd.to_numeric(out["num_pozo"], errors="coerce")
+    if "colonia" not in out.columns:
+        out["colonia"] = out.get("nom_pozo", pd.Series([""] * len(out))).fillna("").astype(str)
+    if "alcaldia" not in out.columns:
+        out["alcaldia"] = ""
     if "en_poniente" in out.columns:
         out["en_poniente"] = out["en_poniente"].astype(str).str.lower().isin(["true", "1", "yes"])
+    elif "en_bbox_piloto" in out.columns:
+        out["en_poniente"] = out["en_bbox_piloto"].astype(str).str.lower().isin(["true", "1", "yes"])
     return out
+
+
+def piezo_table_view(df: pd.DataFrame, include_coords: bool = False) -> pd.DataFrame:
+    """Arma tabla de pozos solo con columnas disponibles."""
+    rename = {
+        "num_pozo": "No. pozo",
+        "colonia": "Colonia",
+        "alcaldia": "Alcaldía",
+        "semaforo": "Semáforo",
+        "tasa_abatimiento_m_anio": "Bajada (m/año)" if not include_coords else "Bajada del nivel (m/año)",
+        "consejo_para_piperos": "Consejo",
+        "latitud": "Latitud",
+        "longitud": "Longitud",
+    }
+    wanted = ["num_pozo", "colonia", "alcaldia", "semaforo", "tasa_abatimiento_m_anio", "consejo_para_piperos"]
+    if include_coords:
+        wanted.extend(["latitud", "longitud"])
+    cols = [c for c in wanted if c in df.columns]
+    if not cols:
+        return pd.DataFrame()
+    return df[cols].rename(columns={k: v for k, v in rename.items() if k in cols})
 
 
 def load_dashboard_layers() -> dict:
@@ -799,16 +827,7 @@ def main() -> None:
         st.markdown("#### ✅ Más preferibles")
         if len(preferir):
             st.dataframe(
-                preferir.head(8)[["num_pozo", "colonia", "alcaldia", "semaforo", "tasa_abatimiento_m_anio", "consejo_para_piperos"]].rename(
-                    columns={
-                        "num_pozo": "No. pozo",
-                        "colonia": "Colonia",
-                        "alcaldia": "Alcaldía",
-                        "semaforo": "Semáforo",
-                        "tasa_abatimiento_m_anio": "Bajada (m/año)",
-                        "consejo_para_piperos": "Consejo",
-                    }
-                ),
+                piezo_table_view(preferir.head(8)),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -823,16 +842,7 @@ def main() -> None:
         st.markdown("#### ⛔ Más críticos")
         if len(evitar):
             st.dataframe(
-                evitar.head(8)[["num_pozo", "colonia", "alcaldia", "semaforo", "tasa_abatimiento_m_anio", "consejo_para_piperos"]].rename(
-                    columns={
-                        "num_pozo": "No. pozo",
-                        "colonia": "Colonia",
-                        "alcaldia": "Alcaldía",
-                        "semaforo": "Semáforo",
-                        "tasa_abatimiento_m_anio": "Bajada (m/año)",
-                        "consejo_para_piperos": "Consejo",
-                    }
-                ),
+                piezo_table_view(evitar.head(8)),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -848,20 +858,7 @@ def main() -> None:
     with t1:
         if len(pie_series):
             full = pie_series.sort_values("tasa_abatimiento_m_anio", ascending=False)
-            full_view = full[
-                ["num_pozo", "colonia", "alcaldia", "semaforo", "tasa_abatimiento_m_anio", "consejo_para_piperos", "latitud", "longitud"]
-            ].rename(
-                columns={
-                    "num_pozo": "No. pozo",
-                    "colonia": "Colonia",
-                    "alcaldia": "Alcaldía",
-                    "semaforo": "Semáforo",
-                    "tasa_abatimiento_m_anio": "Bajada del nivel (m/año)",
-                    "consejo_para_piperos": "Consejo",
-                    "latitud": "Latitud",
-                    "longitud": "Longitud",
-                }
-            )
+            full_view = piezo_table_view(full, include_coords=True)
             selected = st.dataframe(
                 full_view,
                 use_container_width=True,
