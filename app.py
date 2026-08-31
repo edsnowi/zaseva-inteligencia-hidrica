@@ -62,14 +62,32 @@ def consejo_pipero(nivel: str) -> str:
 
 def get_db_url() -> str | None:
     """URI de Supabase desde Secrets (Cloud) o variable de entorno (local)."""
+    url = None
     try:
         url = st.secrets.get("SUPABASE_DB_URL")  # type: ignore[attr-defined]
-        if url:
-            return str(url).strip()
     except Exception:
-        pass
-    url = os.environ.get("SUPABASE_DB_URL")
-    return url.strip() if url else None
+        url = None
+    if not url:
+        url = os.environ.get("SUPABASE_DB_URL")
+    if not url:
+        return None
+    # Limpiar saltos de línea del recuadro de Secrets y espacios
+    cleaned = (
+        str(url)
+        .replace("\r", "")
+        .replace("\n", "")
+        .replace(" ", "")
+        .strip()
+        .strip('"')
+        .strip("'")
+    )
+    if not cleaned:
+        return None
+    # Supabase / Streamlit Cloud suelen requerir SSL
+    if "sslmode=" not in cleaned.lower():
+        sep = "&" if "?" in cleaned else "?"
+        cleaned = f"{cleaned}{sep}sslmode=require"
+    return cleaned
 
 
 @st.cache_data(ttl=300)
@@ -80,7 +98,7 @@ def load_csv(name: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_sql(query: str) -> pd.DataFrame:
     """Lee una consulta SQL desde Supabase. Vacío si no hay URL o falla."""
     url = get_db_url()
@@ -89,11 +107,36 @@ def load_sql(query: str) -> pd.DataFrame:
     try:
         from sqlalchemy import create_engine, text
 
-        engine = create_engine(url)
+        engine = create_engine(url, pool_pre_ping=True)
         with engine.connect() as conn:
             return pd.read_sql(text(query), conn)
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def probe_supabase() -> dict:
+    """Prueba de conexión + conteo SAR para diagnóstico en pantalla."""
+    url = get_db_url()
+    if not url:
+        return {"ok": False, "error": "Sin SUPABASE_DB_URL", "sar_n": 0, "salud_n": 0}
+    try:
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(url, pool_pre_ping=True)
+        with engine.connect() as conn:
+            sar_n = int(conn.execute(text(
+                "SELECT COUNT(*) FROM zaseva.anomalias_satelitales_sar WHERE humedad_anomala = TRUE"
+            )).scalar() or 0)
+            salud_n = int(conn.execute(text(
+                "SELECT COUNT(*) FROM zaseva.mapa_salud_red_correlacionado"
+            )).scalar() or 0)
+            diag_n = int(conn.execute(text(
+                "SELECT COUNT(*) FROM zaseva.vista_diagnostico_alcaldia_resumen"
+            )).scalar() or 0)
+        return {"ok": True, "error": "", "sar_n": sar_n, "salud_n": salud_n, "diag_n": diag_n}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "sar_n": 0, "salud_n": 0, "diag_n": 0}
 
 
 @st.cache_data(ttl=300)
@@ -289,7 +332,19 @@ def main() -> None:
     db_ok = layers["db_ok"]
 
     if db_ok:
-        st.caption(f"Fuente de datos: **{fuente}** · Supabase conectado.")
+        probe = probe_supabase()
+        if probe["ok"]:
+            st.caption(
+                f"Fuente de datos: **{fuente}** · Supabase conectado · "
+                f"SAR={probe['sar_n']} · salud={probe['salud_n']} · diagnóstico={probe.get('diag_n', 0)}"
+            )
+        else:
+            st.warning(
+                "Hay `SUPABASE_DB_URL`, pero la consulta a la base falló. "
+                "Revisa el Secret (sin saltos raros) y que sea el mismo proyecto de Supabase."
+            )
+            with st.expander("Detalle técnico del error de conexión"):
+                st.code(probe["error"][:1500] if probe["error"] else "(sin detalle)")
     else:
         st.caption(
             "Fuente de datos: **CSV local**. "
