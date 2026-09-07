@@ -277,22 +277,22 @@ def nearest_points_text(
     df = pool.dropna(subset=["latitud", "longitud"]).copy()
     if df.empty:
         return "Sin vecinos cercanos"
-    df = df.copy()
-    df["_d2"] = (df["latitud"] - lat) ** 2 + (df["longitud"] - lon) ** 2
-    # excluir el mismo punto si coincide
-    df = df[df["_d2"] > 1e-12]
-    top = df.nsmallest(n, "_d2")
-    if top.empty:
+    d2 = (df["latitud"] - lat) ** 2 + (df["longitud"] - lon) ** 2
+    # excluir el mismo punto si coincide (no usar columna "_d2": itertuples la omite)
+    df = df.loc[d2 > 1e-12].copy()
+    if df.empty:
         return "Sin vecinos cercanos"
+    df["dist_km"] = (d2.loc[df.index] ** 0.5) * 111.0
+    top = df.nsmallest(n, "dist_km")
     parts = []
-    for r in top.itertuples():
-        lab = getattr(r, label_col, None)
-        alc = getattr(r, "alcaldia", "") or ""
-        dist_km = (getattr(r, "_d2") ** 0.5) * 111.0
+    for _, row in top.iterrows():
+        lab = row.get(label_col)
+        alc = str(row.get("alcaldia") or "").strip()
+        dist_km = float(row["dist_km"])
         if lab is not None and pd.notna(lab):
             parts.append(f"#{int(lab)} {alc} (~{dist_km:.1f} km)".strip())
         else:
-            parts.append(f"{alc} (~{dist_km:.1f} km)".strip())
+            parts.append(f"{alc} (~{dist_km:.1f} km)".strip() if alc else f"(~{dist_km:.1f} km)")
     return " | ".join(parts)
 
 
