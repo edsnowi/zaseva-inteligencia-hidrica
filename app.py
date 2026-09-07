@@ -193,6 +193,110 @@ def piezo_table_view(df: pd.DataFrame, include_coords: bool = False) -> pd.DataF
     return df[cols].rename(columns={k: v for k, v in rename.items() if k in cols})
 
 
+def assign_alcaldia_to_points(points: pd.DataFrame, colonias: pd.DataFrame) -> pd.DataFrame:
+    """Asigna alcaldía a puntos SAR por colonia más cercana (centroide)."""
+    if points.empty or colonias.empty:
+        out = points.copy()
+        if "alcaldia" not in out.columns:
+            out["alcaldia"] = "Sin asignar"
+        return out
+    if "alcaldia" in points.columns and points["alcaldia"].notna().any():
+        out = points.copy()
+        out["alcaldia"] = out["alcaldia"].fillna("Sin asignar").astype(str)
+        return out
+    need = {"latitud", "longitud"}.issubset(points.columns)
+    cneed = {"latitud_centro", "longitud_centro", "alcaldia"}.issubset(colonias.columns)
+    if not need or not cneed:
+        out = points.copy()
+        out["alcaldia"] = "Sin asignar"
+        return out
+
+    pts = points.dropna(subset=["latitud", "longitud"]).copy()
+    cols = colonias.dropna(subset=["latitud_centro", "longitud_centro", "alcaldia"]).copy()
+    if pts.empty or cols.empty:
+        out = points.copy()
+        out["alcaldia"] = "Sin asignar"
+        return out
+
+    # Vecino más cercano en grados (suficiente para asignación a alcaldía)
+    c_lat = cols["latitud_centro"].to_numpy()
+    c_lon = cols["longitud_centro"].to_numpy()
+    c_alc = cols["alcaldia"].astype(str).to_numpy()
+    assigned = []
+    for lat, lon in zip(pts["latitud"].to_numpy(), pts["longitud"].to_numpy()):
+        d2 = (c_lat - lat) ** 2 + (c_lon - lon) ** 2
+        assigned.append(c_alc[int(d2.argmin())])
+    pts = pts.copy()
+    pts["alcaldia"] = assigned
+    return pts
+
+
+def humedad_por_alcaldia(
+    sar: pd.DataFrame,
+    salud: pd.DataFrame,
+    diagnostico: pd.DataFrame,
+    colonias: pd.DataFrame,
+    alcaldias_filtro: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Tabla comercial: humedades anómalas (fugas invisibles proxy) por alcaldía/municipio.
+    """
+    # 1) Preferir vista B2G si trae conteos
+    if len(diagnostico) and "alcaldia" in diagnostico.columns and "puntos_criticos_fugas" in diagnostico.columns:
+        out = diagnostico[["alcaldia", "puntos_criticos_fugas"]].copy()
+        if "score_severidad_max" in diagnostico.columns:
+            out["score_severidad_max"] = diagnostico["score_severidad_max"]
+        if "nivel_riesgo_estructural" in diagnostico.columns:
+            out["nivel_riesgo_estructural"] = diagnostico["nivel_riesgo_estructural"]
+        out = out.rename(columns={"puntos_criticos_fugas": "humedades_anomalas"})
+    # 2) Si no, agregar desde mapa_salud
+    elif len(salud) and "alcaldia" in salud.columns:
+        out = (
+            salud.dropna(subset=["alcaldia"])
+            .groupby("alcaldia", dropna=False)
+            .agg(
+                humedades_anomalas=("score_severidad_fuga", "count"),
+                score_severidad_max=("score_severidad_fuga", "max"),
+            )
+            .reset_index()
+        )
+        out["nivel_riesgo_estructural"] = out["score_severidad_max"].map(
+            lambda s: "CRITICO" if s >= 75 else "ALTO" if s >= 50 else "MEDIO" if s >= 25 else "BAJO"
+        )
+    # 3) Último recurso: asignar SAR a alcaldía por cercanía a colonias
+    elif len(sar):
+        tagged = assign_alcaldia_to_points(sar, colonias)
+        out = (
+            tagged.groupby("alcaldia", dropna=False)
+            .size()
+            .reset_index(name="humedades_anomalas")
+        )
+        out["score_severidad_max"] = pd.NA
+        out["nivel_riesgo_estructural"] = "REVISAR"
+    else:
+        return pd.DataFrame(
+            columns=["alcaldia", "humedades_anomalas", "score_severidad_max", "nivel_riesgo_estructural", "prioridad"]
+        )
+
+    if alcaldias_filtro:
+        out = out[out["alcaldia"].isin(alcaldias_filtro)]
+
+    out["humedades_anomalas"] = pd.to_numeric(out["humedades_anomalas"], errors="coerce").fillna(0).astype(int)
+    out = out.sort_values("humedades_anomalas", ascending=False)
+    # Prioridad comercial simple
+    def _prio(n: int) -> str:
+        if n >= 200:
+            return "URGENTE — alta densidad de señales"
+        if n >= 50:
+            return "ALTA — conviene inspección"
+        if n >= 10:
+            return "MEDIA — monitorear"
+        return "BAJA"
+
+    out["prioridad"] = out["humedades_anomalas"].map(_prio)
+    return out.reset_index(drop=True)
+
+
 def load_dashboard_layers() -> dict:
     """
     Carga capas del dashboard.
@@ -545,12 +649,24 @@ def main() -> None:
     with left:
         st.markdown("### Mapa")
         st.caption(
-            "**Cómo leer el mapa:** "
-            "puntos de color (rojo/naranja/verde) = pozos piezométricos; "
-            "anillos = concesiones REPDA; "
-            "**puntos cyan = fugas invisibles (proxy)** = humedad anómala detectada por radar Sentinel-1. "
-            "No es una fuga confirmada en campo: es una señal satelital para priorizar inspección."
+            "**Cómo venderlo:** los puntos cyan son señales de **humedad anómala bajo superficie** "
+            "(posible fuga invisible). Sirven para decirle a una alcaldía: "
+            "“aquí hay que inspeccionar; pueden estar perdiendo agua sin verla en calle”."
         )
+        with st.expander("Leyenda de colores (para plática con alcaldías)", expanded=True):
+            st.markdown(
+                """
+                | Qué ves | Significa | Frase útil |
+                |---|---|---|
+                | **Cyan / azul-verde** | Humedad anómala Sentinel-1 (**fuga invisible proxy**) | “Hay señal de agua donde no debería; prioricen revisión de red.” |
+                | **Rojo** | Pozo con abatimiento **ALTO** | “El nivel freático baja rápido en esta zona.” |
+                | **Naranja** | Pozo **MEDIO** | “Estrés moderado; vigilar.” |
+                | **Verde / teal** | Pozo leve o estable | “Menor presión relativa.” |
+                | **Anillo oscuro** | Concesión REPDA | “Extracción autorizada (no es bombeo en vivo).” |
+
+                **Importante:** cyan ≠ fuga ya confirmada en campo. Es evidencia satelital para **ordenar inspecciones** y coordinar logística ZASEVA.
+                """
+            )
 
         layers = []
         mostrar_sar = st.checkbox("Mostrar anomalías SAR (fugas invisibles)", value=True, key="show_sar")
@@ -721,49 +837,109 @@ def main() -> None:
                 )
 
     with right:
-        st.markdown("### Acuíferos que tocan CDMX")
-        oferta_view = pd.DataFrame(
-            {
-                "Clave acuífero": oferta.get("cve_acui"),
-                "Nombre del acuífero": oferta.get("nom_acui"),
-                "Entidad": oferta.get("nom_edo"),
-                "Recarga (hm³/año)": oferta.get("recarga_to_hm3"),
-                "Déficit (hm³/año)": oferta.get("deficit_hm3"),
-            }
+        st.markdown("### Humedad anómala por alcaldía")
+        st.caption(
+            "Conteo de señales SAR (fugas invisibles proxy). "
+            "Úsalo para priorizar: más puntos = más urgente revisar la red."
         )
-        st.dataframe(oferta_view, use_container_width=True, hide_index=True)
 
-        st.markdown("### Sequía oficial por alcaldía")
-        if len(sequia):
-            sequia_view = pd.DataFrame(
-                {
-                    "Alcaldía / municipio": sequia.get("nombre_mun"),
-                    "Semáforo sequía": sequia.get("sps"),
-                    "Reducción pedida": sequia.get("ahorro_uso_eficiente"),
+        hum = humedad_por_alcaldia(
+            sar=sar,
+            salud=salud,
+            diagnostico=diagnostico,
+            colonias=colonias,
+            alcaldias_filtro=seleccion_alcaldias if seleccion_alcaldias else None,
+        )
+        if len(hum):
+            top = hum.iloc[0]
+            st.warning(
+                f"**Prioridad sugerida:** {top['alcaldia']} — "
+                f"**{int(top['humedades_anomalas'])}** señales de humedad anómala. "
+                f"{top.get('prioridad', '')}"
+            )
+            hum_view = hum.rename(
+                columns={
+                    "alcaldia": "Alcaldía / municipio",
+                    "humedades_anomalas": "No. humedades anómalas",
+                    "score_severidad_max": "Score máx. severidad",
+                    "nivel_riesgo_estructural": "Riesgo",
+                    "prioridad": "Prioridad de revisión",
                 }
             )
-            st.dataframe(sequia_view, use_container_width=True, hide_index=True, height=260)
-        else:
-            st.info("Sin datos de sequía.")
-
-        st.markdown("### Concesiones por uso (filtro actual)")
-        if len(titles):
-            tfilt = titles.copy()
-            if ambito == "Corredor Poniente" and "en_poniente" in tfilt.columns:
-                tfilt = tfilt[tfilt["en_poniente"] == True]  # noqa: E712
-            if seleccion_alcaldias and "alcaldia" in tfilt.columns:
-                tfilt = tfilt[tfilt["alcaldia"].isin(seleccion_alcaldias)]
-            if filtro_colonias_activo and "colonia" in tfilt.columns:
-                tfilt = tfilt[tfilt["colonia"].isin(colonia_sel_rows["colonia"].unique())]
-            if len(tfilt):
-                uso = (
-                    tfilt.groupby("uso", dropna=False)["volumen_hm3_anio"]
-                    .sum()
-                    .sort_values(ascending=False)
-                    .reset_index()
-                    .rename(columns={"uso": "Uso del agua", "volumen_hm3_anio": "hm³ / año"})
+            st.dataframe(hum_view, use_container_width=True, hide_index=True, height=280)
+            st.markdown(
+                """
+                **Frase lista para alcaldía:**  
+                *“Detectamos N señales de humedad anómala en su territorio. 
+                No es lluvia ni sequía del semáforo oficial: es posible pérdida de agua en red. 
+                ZASEVA ayuda a localizar, priorizar y coordinar la logística de solución.”*
+                """.replace("N", str(int(hum["humedades_anomalas"].sum())))
+            )
+            if "No. humedades anómalas" in hum_view.columns:
+                chart_df = hum_view.head(8).copy()
+                st.bar_chart(
+                    chart_df,
+                    x="Alcaldía / municipio",
+                    y="No. humedades anómalas",
+                    horizontal=True,
                 )
-                st.bar_chart(uso, x="Uso del agua", y="hm³ / año", horizontal=True)
+        else:
+            st.info(
+                "Aún no hay conteo de humedad anómala por alcaldía. "
+                "Verifica que el ETL SAR haya corrido y que Supabase tenga filas."
+            )
+
+        with st.expander("Acuíferos que tocan CDMX", expanded=False):
+            oferta_view = pd.DataFrame(
+                {
+                    "Clave acuífero": oferta.get("cve_acui"),
+                    "Nombre del acuífero": oferta.get("nom_acui"),
+                    "Entidad": oferta.get("nom_edo"),
+                    "Recarga (hm³/año)": oferta.get("recarga_to_hm3"),
+                    "Déficit (hm³/año)": oferta.get("deficit_hm3"),
+                }
+            )
+            st.dataframe(oferta_view, use_container_width=True, hide_index=True)
+
+        with st.expander("Sequía oficial por alcaldía (contexto)", expanded=False):
+            st.caption(
+                "Útil como contraste: a veces el semáforo dice “sin sequía” y aun así hay déficit "
+                "estructural + humedad anómala (pérdidas de red)."
+            )
+            if len(sequia):
+                sequia_view = pd.DataFrame(
+                    {
+                        "Alcaldía / municipio": sequia.get("nombre_mun"),
+                        "Semáforo sequía": sequia.get("sps"),
+                        "Reducción pedida": sequia.get("ahorro_uso_eficiente"),
+                    }
+                )
+                st.dataframe(sequia_view, use_container_width=True, hide_index=True, height=220)
+            else:
+                st.info("Sin datos de sequía.")
+
+        with st.expander("Concesiones por uso (filtro actual)", expanded=False):
+            if len(titles):
+                tfilt = titles.copy()
+                if ambito == "Corredor Poniente" and "en_poniente" in tfilt.columns:
+                    tfilt = tfilt[tfilt["en_poniente"] == True]  # noqa: E712
+                if seleccion_alcaldias and "alcaldia" in tfilt.columns:
+                    tfilt = tfilt[tfilt["alcaldia"].isin(seleccion_alcaldias)]
+                if filtro_colonias_activo and "colonia" in tfilt.columns:
+                    tfilt = tfilt[tfilt["colonia"].isin(colonia_sel_rows["colonia"].unique())]
+                if len(tfilt):
+                    uso = (
+                        tfilt.groupby("uso", dropna=False)["volumen_hm3_anio"]
+                        .sum()
+                        .sort_values(ascending=False)
+                        .reset_index()
+                        .rename(columns={"uso": "Uso del agua", "volumen_hm3_anio": "hm³ / año"})
+                    )
+                    st.bar_chart(uso, x="Uso del agua", y="hm³ / año", horizontal=True)
+                else:
+                    st.write("Sin títulos en este filtro.")
+            else:
+                st.write("Sin títulos.")
 
     st.divider()
     st.markdown("### Diagnóstico B2G — alcaldías (Sentinel-1 × acuífero × pozos)")
