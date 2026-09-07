@@ -101,17 +101,24 @@ def load_csv(name: str) -> pd.DataFrame:
 @st.cache_data(ttl=60)
 def load_sql(query: str) -> pd.DataFrame:
     """Lee una consulta SQL desde Supabase. Vacío si no hay URL o falla."""
+    df, _err = load_sql_status(query)
+    return df
+
+
+@st.cache_data(ttl=60)
+def load_sql_status(query: str) -> tuple[pd.DataFrame, str]:
+    """Como load_sql, pero también devuelve el error (si hubo)."""
     url = get_db_url()
     if not url:
-        return pd.DataFrame()
+        return pd.DataFrame(), "Sin SUPABASE_DB_URL"
     try:
         from sqlalchemy import create_engine, text
 
         engine = create_engine(url, pool_pre_ping=True)
         with engine.connect() as conn:
-            return pd.read_sql(text(query), conn)
-    except Exception:
-        return pd.DataFrame()
+            return pd.read_sql(text(query), conn), ""
+    except Exception as exc:
+        return pd.DataFrame(), str(exc)
 
 
 @st.cache_data(ttl=60)
@@ -238,17 +245,19 @@ def filter_points_by_alcaldias(
     alcaldias: list[str] | None,
     pad: float = 0.02,
 ) -> pd.DataFrame:
-    """Filtra puntos por nombre de alcaldía o, si no hay match, por bbox de colonias."""
+    """Filtra puntos por nombre de alcaldía o, si no hay match útil, por bbox de colonias."""
     if points.empty or not alcaldias:
         return points
     out = points.copy()
     if "alcaldia" in out.columns:
         by_name = out[out["alcaldia"].astype(str).isin(alcaldias)]
-        # Solo confiar en nombre si recupera una fracción razonable; si no, bbox
-        if len(by_name) and (len(by_name) >= max(3, int(0.05 * len(out))) or len(out) < 20):
+        # Exigir que el match por nombre recupere una fracción razonable
+        min_keep = max(3, int(0.05 * len(out))) if len(out) >= 20 else 1
+        if len(by_name) >= min_keep:
             return by_name
+    # Fallback geográfico (o devolver todo si no hay colonias)
     if colonias.empty or not {"alcaldia", "latitud_centro", "longitud_centro"}.issubset(colonias.columns):
-        return out if "alcaldia" not in out.columns else out[out["alcaldia"].astype(str).isin(alcaldias)]
+        return out
     if not {"latitud", "longitud"}.issubset(out.columns):
         return out
     foc = colonias[colonias["alcaldia"].isin(alcaldias)].dropna(subset=["latitud_centro", "longitud_centro"])
@@ -256,12 +265,15 @@ def filter_points_by_alcaldias(
         return out
     lat_min, lat_max = float(foc["latitud_centro"].min()) - pad, float(foc["latitud_centro"].max()) + pad
     lon_min, lon_max = float(foc["longitud_centro"].min()) - pad, float(foc["longitud_centro"].max()) + pad
-    return out[
+    geo = out[
         (out["latitud"] >= lat_min)
         & (out["latitud"] <= lat_max)
         & (out["longitud"] >= lon_min)
         & (out["longitud"] <= lon_max)
     ]
+    # Si el bbox también deja 0 pero había puntos, no borrar la capa entera
+    return geo if len(geo) else out
+
 
 
 def nearest_points_text(
@@ -473,7 +485,7 @@ def load_dashboard_layers() -> dict:
     if sequia.empty:
         sequia = load_csv("riesgo_sequia_poniente.csv")
 
-    sar = load_sql(
+    sar, sar_err = load_sql_status(
         """
         SELECT anomalia_id, fecha_escena, polarizacion, backscatter_db, delta_db,
                humedad_anomala, cve_acui, latitud, longitud, dist_pozo_critico_m
@@ -514,6 +526,7 @@ def load_dashboard_layers() -> dict:
         "titles": titles,
         "sequia": sequia,
         "sar": sar,
+        "sar_err": sar_err,
         "diagnostico": diagnostico,
         "salud": salud,
         "fuente": fuente,
@@ -555,6 +568,7 @@ def main() -> None:
     titles = layers["titles"]
     sequia = layers["sequia"]
     sar = layers["sar"]
+    sar_err = layers.get("sar_err", "")
     diagnostico = layers["diagnostico"]
     salud = layers["salud"]
     fuente = layers["fuente"]
@@ -565,8 +579,22 @@ def main() -> None:
         if probe["ok"]:
             st.caption(
                 f"Fuente de datos: **{fuente}** · Supabase conectado · "
-                f"SAR={probe['sar_n']} · salud={probe['salud_n']} · diagnóstico={probe.get('diag_n', 0)}"
+                f"SAR en BD={probe['sar_n']} · cargados al mapa={len(sar)} · "
+                f"salud={probe['salud_n']} · diagnóstico={probe.get('diag_n', 0)}"
             )
+            if probe["sar_n"] > 0 and sar.empty:
+                st.error(
+                    "La base tiene puntos SAR, pero la consulta del mapa no trajo filas. "
+                    "Revisa el error abajo (posible columna faltante o cache vieja)."
+                )
+                if sar_err:
+                    with st.expander("Error al cargar SAR"):
+                        st.code(sar_err[:1500])
+            elif probe["sar_n"] == 0:
+                st.warning(
+                    "Supabase está conectado pero la tabla de humedad anómala está vacía "
+                    "(0 filas). Hay que volver a correr el ETL Sentinel-1."
+                )
         else:
             st.warning(
                 "Hay `SUPABASE_DB_URL`, pero la consulta a la base falló. "
@@ -579,11 +607,14 @@ def main() -> None:
             "Fuente de datos: **CSV local**. "
             "Para activar satélite/diagnóstico: configura `SUPABASE_DB_URL` en Streamlit Secrets."
         )
+    if sar_err and not sar.empty:
+        st.caption(f"Nota SAR: {sar_err[:200]}")
 
     colonias = load_csv("colonias_cdmx.csv")
     colonias_geo = load_colonias_geo()
     # Asignar alcaldía a puntos SAR (para filtrar y contar por gobernación)
     sar = assign_alcaldia_to_points(sar, colonias)
+    sar_bruto = sar.copy()  # antes de filtros de ámbito/alcaldía
     if len(salud) and "alcaldia" in salud.columns:
         # Si mapa_salud ya trae alcaldía, preferirla en puntos cercanos vía merge simple no aplica;
         # el assign por colonia cubre el caso SAR crudo.
@@ -659,22 +690,7 @@ def main() -> None:
         if len(rep):
             rep = filter_points_by_alcaldias(rep, colonias, seleccion_alcaldias)
         if len(sar_map):
-            needs_alc = (
-                "alcaldia" not in sar_map.columns
-                or sar_map["alcaldia"].isna().all()
-                or (sar_map["alcaldia"].astype(str).str.strip().isin(["", "nan", "None"])).all()
-            )
-            if needs_alc:
-                sar_map = assign_alcaldia_to_points(sar_map, colonias)
-            # Si el nombre no matchea el catálogo, el filtro por bbox recupera los puntos
-            by_name = (
-                sar_map[sar_map["alcaldia"].astype(str).isin(seleccion_alcaldias)]
-                if "alcaldia" in sar_map.columns
-                else sar_map.head(0)
-            )
-            sar_map = by_name if len(by_name) else filter_points_by_alcaldias(
-                sar_map, colonias, seleccion_alcaldias
-            )
+            sar_map = filter_points_by_alcaldias(sar_map, colonias, seleccion_alcaldias)
         if "alcaldia" in salud_map.columns and len(salud_map):
             salud_map = salud_map[salud_map["alcaldia"].isin(seleccion_alcaldias)]
 
@@ -842,6 +858,15 @@ def main() -> None:
     pie_mapa = filter_points_by_alcaldias(pie.copy(), colonias, alcaldias_mapa)
     rep_mapa = filter_points_by_alcaldias(rep.copy(), colonias, alcaldias_mapa)
     sar_vista = filter_points_by_alcaldias(sar_map.copy(), colonias, alcaldias_mapa)
+    # Nunca dejar la capa SAR en 0 si la BD sí trajo puntos (filtros agresivos / nombres)
+    if sar_vista.empty and len(sar_map):
+        sar_vista = sar_map.copy()
+    if sar_vista.empty and len(sar_bruto):
+        sar_vista = sar_bruto.copy()
+        st.info(
+            "El filtro de alcaldía dejó 0 humedades; mostrando **todos** los puntos SAR cargados "
+            "(el ETL actual cubre sobre todo el **Corredor Poniente**, no las 16 alcaldías)."
+        )
 
     # Recalcular KPI SAR con el foco real del mapa
     sar_count = int(len(sar_vista))
@@ -857,6 +882,7 @@ def main() -> None:
           <div style="background:#1a2332;border:1px solid #7c3aed;border-radius:10px;padding:8px 12px;color:#e2e8f0;">
             <span style="color:#c4b5fd;font-size:0.75rem;">HUMEDAD (MORADO)</span><br/>
             <b>{len(sar_vista)}</b> señales
+            <span style="color:#94a3b8;font-size:0.7rem;"> · bruto {len(sar_bruto)}</span>
           </div>
           <div style="background:#1a2332;border:1px solid #ef4444;border-radius:10px;padding:8px 12px;color:#e2e8f0;">
             <span style="color:#fca5a5;font-size:0.75rem;">POZOS CRÍTICOS</span><br/>
@@ -925,6 +951,7 @@ def main() -> None:
         st.markdown("### Mapa")
         st.caption(
             "**Morado = humedad anómala (alerta de inspección).** "
+            "Hoy el satélite está cargado sobre el **Corredor Poniente** (oeste), no sobre las 16 alcaldías. "
             "Al pasar el mouse sobre humedad o pozo crítico verás los **3 pozos ALTO más cercanos**."
         )
         with st.expander("Leyenda (plática con alcaldías)", expanded=False):
@@ -1094,6 +1121,13 @@ def main() -> None:
         if st.session_state.pozo_sel is not None and len(pmap) and (pmap["num_pozo"] == st.session_state.pozo_sel).any():
             row = pmap[pmap["num_pozo"] == st.session_state.pozo_sel].iloc[0]
             view = pdk.ViewState(latitude=float(row.latitud), longitude=float(row.longitud), zoom=13.5)
+        elif mostrar_sar and len(sar_vista) and {"latitud", "longitud"}.issubset(sar_vista.columns):
+            # Centrar en el parche Sentinel-1 (hoy: Corredor Poniente)
+            view = pdk.ViewState(
+                latitude=float(sar_vista["latitud"].mean()),
+                longitude=float(sar_vista["longitud"].mean()),
+                zoom=11.4,
+            )
         elif filtro_colonias_activo and len(colonia_sel_rows):
             view = pdk.ViewState(
                 latitude=float(colonia_sel_rows["latitud_centro"].mean()),
@@ -1107,12 +1141,6 @@ def main() -> None:
                     latitude=float(foc["latitud_centro"].mean()),
                     longitude=float(foc["longitud_centro"].mean()),
                     zoom=11.2 if len(alcaldias_mapa) <= 2 else 10.4,
-                )
-            elif len(sar_vista):
-                view = pdk.ViewState(
-                    latitude=float(sar_vista["latitud"].mean()),
-                    longitude=float(sar_vista["longitud"].mean()),
-                    zoom=11.5,
                 )
             else:
                 view = pdk.ViewState(latitude=19.36, longitude=-99.15, zoom=10.2)
