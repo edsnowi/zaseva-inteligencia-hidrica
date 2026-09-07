@@ -1048,7 +1048,7 @@ def main() -> None:
             # Si tras filtros queda vacío, mostrar SAR del ámbito sin filtro de nombre
             if smap.empty and len(sar_map):
                 smap = sar_map.dropna(subset=["latitud", "longitud"]).copy()
-            smap["radius"] = 70
+            smap["radius"] = 180
             smap["tip_titulo"] = "Humedad anómala (alerta de inspección)"
             smap["tip_linea1"] = smap.apply(
                 lambda r: f"{r.get('alcaldia', '')} · {r.get('fecha_escena', '')}".strip(" ·"),
@@ -1075,7 +1075,13 @@ def main() -> None:
                     id="sar",
                     get_position="[longitud, latitud]",
                     get_radius="radius",
-                    get_fill_color="[168, 85, 247, 210]",  # morado
+                    radius_min_pixels=6,
+                    radius_max_pixels=28,
+                    get_fill_color="[168, 85, 247, 220]",  # morado
+                    get_line_color="[233, 213, 255, 255]",
+                    line_width_min_pixels=1,
+                    stroked=True,
+                    filled=True,
                     pickable=True,
                 )
             )
