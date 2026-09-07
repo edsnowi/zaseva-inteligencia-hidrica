@@ -485,6 +485,12 @@ def main() -> None:
 
     colonias = load_csv("colonias_cdmx.csv")
     colonias_geo = load_colonias_geo()
+    # Asignar alcaldía a puntos SAR (para filtrar y contar por gobernación)
+    sar = assign_alcaldia_to_points(sar, colonias)
+    if len(salud) and "alcaldia" in salud.columns:
+        # Si mapa_salud ya trae alcaldía, preferirla en puntos cercanos vía merge simple no aplica;
+        # el assign por colonia cubre el caso SAR crudo.
+        pass
 
     # ---- Filtros ----
     ambito = st.selectbox(
@@ -497,6 +503,8 @@ def main() -> None:
     col_cat = colonias.copy()
     pie = piezo.copy()
     rep = repda.copy()
+    sar_map = sar.copy()
+    salud_map = salud.copy()
     if ambito == "Corredor Poniente":
         if "en_poniente" in col_cat.columns:
             col_cat = col_cat[col_cat["en_poniente"] == True]  # noqa: E712
@@ -506,6 +514,13 @@ def main() -> None:
             rep = rep[rep["en_poniente"] == True]  # noqa: E712
         elif "en_bbox_piloto" in pie.columns:
             pie = pie[pie["en_bbox_piloto"] == True]  # noqa: E712
+        if len(sar_map) and {"latitud", "longitud"}.issubset(sar_map.columns):
+            sar_map = sar_map[
+                (sar_map["longitud"] >= -99.31)
+                & (sar_map["longitud"] <= -99.15)
+                & (sar_map["latitud"] >= 19.30)
+                & (sar_map["latitud"] <= 19.45)
+            ]
 
     st.caption(
         "En México a estos barrios se les dice **colonias** (también hay fraccionamientos, pueblos o unidades habitacionales). "
@@ -537,6 +552,10 @@ def main() -> None:
             pie = pie[pie["alcaldia"].isin(seleccion_alcaldias)]
         if "alcaldia" in rep.columns:
             rep = rep[rep["alcaldia"].isin(seleccion_alcaldias)]
+        if "alcaldia" in sar_map.columns:
+            sar_map = sar_map[sar_map["alcaldia"].isin(seleccion_alcaldias)]
+        if "alcaldia" in salud_map.columns:
+            salud_map = salud_map[salud_map["alcaldia"].isin(seleccion_alcaldias)]
 
     with c_col:
         st.markdown("#### Colonias")
@@ -612,8 +631,8 @@ def main() -> None:
     else:
         repda_hm3, n_titles = 0.0, 0
     piezo_critico = int(pie["nivel_estres"].eq("ALTO").sum()) if len(pie) and "nivel_estres" in pie.columns else 0
-    sar_count = int(len(sar)) if len(sar) else 0
-    score_max = float(salud["score_severidad_fuga"].max()) if len(salud) and "score_severidad_fuga" in salud.columns else 0.0
+    sar_count = int(len(sar_map)) if len(sar_map) else 0
+    score_max = float(salud_map["score_severidad_fuga"].max()) if len(salud_map) and "score_severidad_fuga" in salud_map.columns else 0.0
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Déficit acuíferos (CDMX)", f"{deficit:,.0f} hm³/año", help="Suma de déficit de acuíferos que tocan la ciudad.")
@@ -623,22 +642,73 @@ def main() -> None:
     c5.metric(
         "Puntos SAR / humedad",
         f"{sar_count}",
-        help="Anomalías Sentinel-1 (humedad anómala) cargadas desde Supabase.",
+        help="Anomalías Sentinel-1 en el filtro actual (ámbito/alcaldía).",
     )
     if score_max > 0:
-        st.caption(f"Score máximo de severidad de fuga en mapa salud: **{score_max:.0f}/100**")
+        st.caption(f"Score máximo de severidad de fuga (filtro): **{score_max:.0f}/100**")
 
     st.divider()
+
+    # ---- Controles del mapa (capas + alcaldías para gobernaciones) ----
+    st.markdown("### Controles del mapa")
+    st.caption("Elige qué capas ver y a qué alcaldía(s) enfocar la plática con gobierno.")
+
+    ctrl1, ctrl2 = st.columns([1.2, 1])
+    with ctrl1:
+        st.markdown("**Capas a mostrar**")
+        c_sar, c_piezo, c_repda, c_poly = st.columns(4)
+        with c_sar:
+            mostrar_sar = st.checkbox("Humedad anómala (SAR)", value=True, key="show_sar")
+        with c_piezo:
+            mostrar_piezo = st.checkbox("Pozos / estrés", value=True, key="show_piezo")
+        with c_repda:
+            mostrar_repda = st.checkbox("Concesiones REPDA", value=False, key="show_repda")
+        with c_poly:
+            mostrar_poly = st.checkbox("Polígonos colonia", value=True, key="show_poly")
+
+    with ctrl2:
+        alc_mapa_opts = sorted(col_cat["alcaldia"].dropna().unique().tolist()) if len(col_cat) else sorted(seleccion_alcaldias)
+        if not alc_mapa_opts and seleccion_alcaldias:
+            alc_mapa_opts = sorted(seleccion_alcaldias)
+        alcaldias_mapa = st.multiselect(
+            "Alcaldías / municipios en el mapa",
+            options=alc_mapa_opts,
+            default=seleccion_alcaldias if seleccion_alcaldias else alc_mapa_opts,
+            help="Para la reunión con una gobernación, deja solo su alcaldía.",
+        )
+        if not alcaldias_mapa and alc_mapa_opts:
+            alcaldias_mapa = alc_mapa_opts
+
+    pie_mapa = pie.copy()
+    rep_mapa = rep.copy()
+    sar_vista = sar_map.copy()
+    if alcaldias_mapa:
+        if "alcaldia" in pie_mapa.columns:
+            pie_mapa = pie_mapa[pie_mapa["alcaldia"].isin(alcaldias_mapa)]
+        if "alcaldia" in rep_mapa.columns:
+            rep_mapa = rep_mapa[rep_mapa["alcaldia"].isin(alcaldias_mapa)]
+        if "alcaldia" in sar_vista.columns:
+            sar_vista = sar_vista[sar_vista["alcaldia"].isin(alcaldias_mapa)]
+
+    st.caption(
+        f"Mapa enfocado en: **{', '.join(alcaldias_mapa) if alcaldias_mapa else 'todas'}** · "
+        f"SAR={len(sar_vista)} · pozos={len(pie_mapa)} · REPDA={len(rep_mapa)}"
+    )
 
     # ---- Selector pozo ----
     if "pozo_sel" not in st.session_state:
         st.session_state.pozo_sel = None
 
-    pie_series = pie[pie["n_obs"] >= 2] if "n_obs" in pie.columns else pie
-    pie_series = pie_series[pie_series["tasa_abatimiento_m_anio"].notna()] if "tasa_abatimiento_m_anio" in pie_series.columns else pie_series
+    pie_series = pie_mapa[pie_mapa["n_obs"] >= 2] if "n_obs" in pie_mapa.columns else pie_mapa
+    pie_series = (
+        pie_series[pie_series["tasa_abatimiento_m_anio"].notna()]
+        if "tasa_abatimiento_m_anio" in pie_series.columns
+        else pie_series
+    )
     pozo_opts = ["(Ver mapa del filtro actual)"] + [
         f"{int(r.num_pozo)} · {r.semaforo} · {getattr(r, 'colonia', '')}"
         for r in pie_series.sort_values("tasa_abatimiento_m_anio", ascending=False).itertuples()
+        if pd.notna(getattr(r, "num_pozo", None))
     ]
     sel = st.selectbox("🔎 Enfocar un pozo de medición", pozo_opts)
     if sel and sel != "(Ver mapa del filtro actual)":
@@ -650,30 +720,35 @@ def main() -> None:
         st.markdown("### Mapa")
         st.caption(
             "**Cómo venderlo:** los puntos cyan son señales de **humedad anómala bajo superficie** "
-            "(posible fuga invisible). Sirven para decirle a una alcaldía: "
+            "(alerta de inspección). Sirven para decirle a una alcaldía: "
             "“aquí hay que inspeccionar; pueden estar perdiendo agua sin verla en calle”."
         )
-        with st.expander("Leyenda de colores (para plática con alcaldías)", expanded=True):
+        with st.expander("Leyenda de colores (para plática con alcaldías)", expanded=False):
             st.markdown(
                 """
                 | Qué ves | Significa | Frase útil |
                 |---|---|---|
-                | **Cyan / azul-verde** | Humedad anómala Sentinel-1 (**fuga invisible proxy**) | “Hay señal de agua donde no debería; prioricen revisión de red.” |
+                | **Cyan / azul-verde** | Humedad anómala Sentinel-1 (**alerta de inspección**) | “Hay señal de agua donde no debería; prioricen revisión de red.” |
                 | **Rojo** | Pozo con abatimiento **ALTO** | “El nivel freático baja rápido en esta zona.” |
                 | **Naranja** | Pozo **MEDIO** | “Estrés moderado; vigilar.” |
                 | **Verde / teal** | Pozo leve o estable | “Menor presión relativa.” |
-                | **Anillo oscuro** | Concesión REPDA | “Extracción autorizada (no es bombeo en vivo).” |
+                | **Anillo** | Concesión REPDA | “Extracción autorizada (no es bombeo en vivo).” |
 
                 **Importante:** cyan ≠ fuga ya confirmada en campo. Es evidencia satelital para **ordenar inspecciones** y coordinar logística ZASEVA.
                 """
             )
 
         layers = []
-        mostrar_sar = st.checkbox("Mostrar anomalías SAR (fugas invisibles)", value=True, key="show_sar")
-        # polígonos de colonias seleccionadas (máx 40 para no saturar)
-        if filtro_colonias_activo and len(colonias_geo) and len(seleccion_colonias):
+        if (
+            mostrar_poly
+            and filtro_colonias_activo
+            and len(colonias_geo)
+            and len(seleccion_colonias)
+        ):
             labs = seleccion_colonias[:40]
             poly = colonias_geo[colonias_geo["label"].isin(labs)]
+            if alcaldias_mapa and "alcaldia" in getattr(poly, "columns", []):
+                poly = poly[poly["alcaldia"].isin(alcaldias_mapa)]
             if len(poly):
                 layers.append(
                     pdk.Layer(
@@ -681,27 +756,27 @@ def main() -> None:
                         data=poly.__geo_interface__,
                         stroked=True,
                         filled=True,
-                        get_fill_color="[11, 60, 77, 40]",
-                        get_line_color="[11, 60, 77, 220]",
+                        get_fill_color="[0, 180, 200, 35]",
+                        get_line_color="[120, 220, 230, 200]",
                         line_width_min_pixels=2,
                     )
                 )
 
-        pmap = pie_series.copy() if len(pie_series) else pie.copy()
+        pmap = pie_series.copy() if len(pie_series) else pie_mapa.copy()
         color_map = {
-            "ALTO": [196, 92, 38, 210],
-            "MEDIO": [212, 160, 23, 200],
-            "LEVE": [61, 124, 71, 190],
-            "RECUPERACION_O_ESTABLE": [31, 122, 108, 190],
+            "ALTO": [255, 90, 70, 220],
+            "MEDIO": [255, 180, 60, 210],
+            "LEVE": [80, 200, 120, 200],
+            "RECUPERACION_O_ESTABLE": [40, 200, 190, 200],
         }
-        if len(pmap):
+        if mostrar_piezo and len(pmap):
             pmap["fill_color"] = pmap["nivel_estres"].map(
-                lambda x: color_map.get(str(x).upper(), [120, 120, 120, 160])
+                lambda x: color_map.get(str(x).upper(), [160, 160, 160, 180])
             )
             pmap["radius"] = 90
             if st.session_state.pozo_sel is not None:
                 pmap.loc[pmap["num_pozo"] == st.session_state.pozo_sel, "radius"] = 220
-            pmap["tip_titulo"] = pmap["num_pozo"].map(lambda x: f"Pozo {int(x)}")
+            pmap["tip_titulo"] = pmap["num_pozo"].map(lambda x: f"Pozo {int(x)}" if pd.notna(x) else "Pozo")
             pmap["tip_linea1"] = pmap.get("colonia", pd.Series([""] * len(pmap))).fillna("").astype(str)
             pmap["tip_linea2"] = pmap.get("semaforo", pd.Series([""] * len(pmap))).fillna("").astype(str)
             pmap["tip_linea3"] = pmap.get("consejo_para_piperos", pd.Series([""] * len(pmap))).fillna("").astype(str)
@@ -718,8 +793,8 @@ def main() -> None:
                 )
             )
 
-        if len(rep) and {"latitud", "longitud"}.issubset(rep.columns):
-            rmap = rep.dropna(subset=["latitud", "longitud"]).copy()
+        if mostrar_repda and len(rep_mapa) and {"latitud", "longitud"}.issubset(rep_mapa.columns):
+            rmap = rep_mapa.dropna(subset=["latitud", "longitud"]).copy()
             vol_col = "volumen_punto_m3_anio" if "volumen_punto_m3_anio" in rmap.columns else "volumen_m3_anio"
             vmax = max(float(rmap[vol_col].max()), 1.0) if vol_col in rmap.columns and len(rmap) else 1.0
             rmap["radius"] = 30 + 140 * (rmap[vol_col] / vmax) ** 0.5 if vol_col in rmap.columns else 45
@@ -739,25 +814,22 @@ def main() -> None:
                     get_radius="radius",
                     stroked=True,
                     filled=False,
-                    get_line_color="[11, 60, 77, 170]",
+                    get_line_color="[200, 210, 220, 200]",
                     line_width_min_pixels=1,
                     pickable=True,
                 )
             )
 
-        if mostrar_sar and len(sar) and {"latitud", "longitud"}.issubset(sar.columns):
-            smap = sar.dropna(subset=["latitud", "longitud"]).copy()
-            if ambito == "Corredor Poniente":
-                smap = smap[
-                    (smap["longitud"] >= -99.31)
-                    & (smap["longitud"] <= -99.15)
-                    & (smap["latitud"] >= 19.30)
-                    & (smap["latitud"] <= 19.45)
-                ]
+        if mostrar_sar and len(sar_vista) and {"latitud", "longitud"}.issubset(sar_vista.columns):
+            smap = sar_vista.dropna(subset=["latitud", "longitud"]).copy()
             smap["radius"] = 55
-            smap["tip_titulo"] = "Fuga invisible (proxy SAR)"
+            smap["tip_titulo"] = "Alerta de inspección (humedad anómala)"
             smap["tip_linea1"] = smap.apply(
-                lambda r: f"Fecha escena: {r['fecha_escena']}" if pd.notna(r.get("fecha_escena")) else "Sentinel-1",
+                lambda r: (
+                    f"{r.get('alcaldia', '')} · Fecha: {r['fecha_escena']}"
+                    if pd.notna(r.get("fecha_escena"))
+                    else str(r.get("alcaldia", "Sentinel-1"))
+                ),
                 axis=1,
             )
             smap["tip_linea2"] = smap.apply(
@@ -783,12 +855,11 @@ def main() -> None:
                     id="sar",
                     get_position="[longitud, latitud]",
                     get_radius="radius",
-                    get_fill_color="[0, 160, 180, 170]",
+                    get_fill_color="[0, 220, 230, 190]",
                     pickable=True,
                 )
             )
 
-        # view
         if st.session_state.pozo_sel is not None and len(pmap) and (pmap["num_pozo"] == st.session_state.pozo_sel).any():
             row = pmap[pmap["num_pozo"] == st.session_state.pozo_sel].iloc[0]
             view = pdk.ViewState(latitude=float(row.latitud), longitude=float(row.longitud), zoom=13.5)
@@ -798,6 +869,16 @@ def main() -> None:
                 longitude=float(colonia_sel_rows["longitud_centro"].mean()),
                 zoom=12.5 if len(seleccion_colonias) <= 3 else 11.5,
             )
+        elif alcaldias_mapa and len(col_cat):
+            foc = col_cat[col_cat["alcaldia"].isin(alcaldias_mapa)] if "alcaldia" in col_cat.columns else col_cat
+            if len(foc) and {"latitud_centro", "longitud_centro"}.issubset(foc.columns):
+                view = pdk.ViewState(
+                    latitude=float(foc["latitud_centro"].mean()),
+                    longitude=float(foc["longitud_centro"].mean()),
+                    zoom=11.2 if len(alcaldias_mapa) <= 2 else 10.4,
+                )
+            else:
+                view = pdk.ViewState(latitude=19.36, longitude=-99.15, zoom=10.2)
         elif ambito == "Corredor Poniente":
             view = pdk.ViewState(latitude=19.35, longitude=-99.28, zoom=11)
         else:
@@ -807,14 +888,14 @@ def main() -> None:
             pdk.Deck(
                 layers=layers,
                 initial_view_state=view,
-                map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+                map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
                 tooltip={
                     "html": "<b>{tip_titulo}</b><br/>{tip_linea1}<br/>{tip_linea2}<br/>{tip_linea3}",
-                    "style": {"backgroundColor": "#0b3c4d", "color": "white"},
+                    "style": {"backgroundColor": "#0b1220", "color": "#e8f7ff"},
                 },
             ),
             use_container_width=True,
-            height=540,
+            height=560,
             on_select="rerun",
             selection_mode="single-object",
             key="mapa_cdmx",
@@ -844,11 +925,11 @@ def main() -> None:
         )
 
         hum = humedad_por_alcaldia(
-            sar=sar,
-            salud=salud,
+            sar=sar_vista if len(sar_vista) else sar_map,
+            salud=salud_map if len(salud_map) else salud,
             diagnostico=diagnostico,
             colonias=colonias,
-            alcaldias_filtro=seleccion_alcaldias if seleccion_alcaldias else None,
+            alcaldias_filtro=alcaldias_mapa if alcaldias_mapa else (seleccion_alcaldias if seleccion_alcaldias else None),
         )
         if len(hum):
             top = hum.iloc[0]
