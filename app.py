@@ -349,17 +349,40 @@ def humedad_por_alcaldia(
 ) -> pd.DataFrame:
     """
     Tabla comercial: humedades anómalas (fugas invisibles proxy) por alcaldía/municipio.
+
+    Prioridad: contar puntos SAR reales (los del mapa). Score/riesgo se cruzan
+    desde la vista B2G o mapa_salud si existen.
     """
-    # 1) Preferir vista B2G si trae conteos
-    if len(diagnostico) and "alcaldia" in diagnostico.columns and "puntos_criticos_fugas" in diagnostico.columns:
-        out = diagnostico[["alcaldia", "puntos_criticos_fugas"]].copy()
-        if "score_severidad_max" in diagnostico.columns:
-            out["score_severidad_max"] = diagnostico["score_severidad_max"]
-        if "nivel_riesgo_estructural" in diagnostico.columns:
-            out["nivel_riesgo_estructural"] = diagnostico["nivel_riesgo_estructural"]
-        out = out.rename(columns={"puntos_criticos_fugas": "humedades_anomalas"})
-    # 2) Si no, agregar desde mapa_salud
-    elif len(salud) and "alcaldia" in salud.columns:
+    out = pd.DataFrame(columns=["alcaldia", "humedades_anomalas", "score_severidad_max", "nivel_riesgo_estructural"])
+
+    # 1) Conteo real desde SAR (misma fuente que los círculos morados)
+    if len(sar) and {"latitud", "longitud"}.issubset(sar.columns):
+        tagged = sar.copy()
+        if "alcaldia" not in tagged.columns or tagged["alcaldia"].isna().all():
+            tagged = assign_alcaldia_to_points(tagged, colonias)
+        tagged = tagged[tagged["alcaldia"].astype(str).str.strip().isin(["", "nan", "None", "Sin asignar"]) == False]
+        if len(tagged):
+            out = (
+                tagged.groupby("alcaldia", dropna=False)
+                .size()
+                .reset_index(name="humedades_anomalas")
+            )
+            out["score_severidad_max"] = pd.NA
+            out["nivel_riesgo_estructural"] = pd.NA
+
+    # 2) Si no hubo SAR, usar vista diagnóstico (solo si trae conteos > 0)
+    if out.empty and len(diagnostico) and "alcaldia" in diagnostico.columns and "puntos_criticos_fugas" in diagnostico.columns:
+        tmp = diagnostico[["alcaldia", "puntos_criticos_fugas"]].copy()
+        tmp = tmp.rename(columns={"puntos_criticos_fugas": "humedades_anomalas"})
+        if int(pd.to_numeric(tmp["humedades_anomalas"], errors="coerce").fillna(0).sum()) > 0:
+            out = tmp
+            if "score_severidad_max" in diagnostico.columns:
+                out["score_severidad_max"] = diagnostico["score_severidad_max"].values
+            if "nivel_riesgo_estructural" in diagnostico.columns:
+                out["nivel_riesgo_estructural"] = diagnostico["nivel_riesgo_estructural"].values
+
+    # 3) Último recurso: mapa_salud
+    if out.empty and len(salud) and "alcaldia" in salud.columns:
         out = (
             salud.dropna(subset=["alcaldia"])
             .groupby("alcaldia", dropna=False)
@@ -372,27 +395,58 @@ def humedad_por_alcaldia(
         out["nivel_riesgo_estructural"] = out["score_severidad_max"].map(
             lambda s: "CRITICO" if s >= 75 else "ALTO" if s >= 50 else "MEDIO" if s >= 25 else "BAJO"
         )
-    # 3) Último recurso: asignar SAR a alcaldía por cercanía a colonias
-    elif len(sar):
-        tagged = assign_alcaldia_to_points(sar, colonias)
-        out = (
-            tagged.groupby("alcaldia", dropna=False)
-            .size()
-            .reset_index(name="humedades_anomalas")
-        )
-        out["score_severidad_max"] = pd.NA
-        out["nivel_riesgo_estructural"] = "REVISAR"
-    else:
+
+    if out.empty:
         return pd.DataFrame(
             columns=["alcaldia", "humedades_anomalas", "score_severidad_max", "nivel_riesgo_estructural", "prioridad"]
         )
 
+    # Cruzar score/riesgo de la vista B2G si hace falta
+    if len(diagnostico) and "alcaldia" in diagnostico.columns:
+        meta = diagnostico.copy()
+        keep = [c for c in ["alcaldia", "score_severidad_max", "nivel_riesgo_estructural"] if c in meta.columns]
+        if len(keep) > 1:
+            meta = meta[keep].drop_duplicates("alcaldia")
+            out = out.merge(meta, on="alcaldia", how="left", suffixes=("", "_diag"))
+            if "score_severidad_max_diag" in out.columns:
+                out["score_severidad_max"] = out["score_severidad_max"].fillna(out["score_severidad_max_diag"])
+                out = out.drop(columns=["score_severidad_max_diag"])
+            if "nivel_riesgo_estructural_diag" in out.columns:
+                out["nivel_riesgo_estructural"] = out["nivel_riesgo_estructural"].fillna(
+                    out["nivel_riesgo_estructural_diag"]
+                )
+                out = out.drop(columns=["nivel_riesgo_estructural_diag"])
+
+    # Si aún no hay score, aproximar con mapa_salud
+    if out["score_severidad_max"].isna().all() and len(salud) and "alcaldia" in salud.columns and "score_severidad_fuga" in salud.columns:
+        sc = (
+            salud.dropna(subset=["alcaldia"])
+            .groupby("alcaldia")["score_severidad_fuga"]
+            .max()
+            .reset_index(name="score_severidad_max")
+        )
+        out = out.drop(columns=["score_severidad_max"], errors="ignore").merge(sc, on="alcaldia", how="left")
+
+    if "nivel_riesgo_estructural" not in out.columns or out["nivel_riesgo_estructural"].isna().all():
+        out["nivel_riesgo_estructural"] = pd.to_numeric(out.get("score_severidad_max"), errors="coerce").map(
+            lambda s: (
+                "CRITICO" if pd.notna(s) and s >= 75
+                else "ALTO" if pd.notna(s) and s >= 50
+                else "MEDIO" if pd.notna(s) and s >= 25
+                else "BAJO" if pd.notna(s)
+                else "REVISAR"
+            )
+        )
+
     if alcaldias_filtro:
-        out = out[out["alcaldia"].isin(alcaldias_filtro)]
+        # No descartar filas SAR si el nombre no matchea el filtro; filtrar solo si hay overlap
+        matched = out[out["alcaldia"].isin(alcaldias_filtro)]
+        if len(matched):
+            out = matched
 
     out["humedades_anomalas"] = pd.to_numeric(out["humedades_anomalas"], errors="coerce").fillna(0).astype(int)
     out = out.sort_values("humedades_anomalas", ascending=False)
-    # Prioridad comercial simple
+
     def _prio(n: int) -> str:
         if n >= 200:
             return "URGENTE — alta densidad de señales"
@@ -400,7 +454,9 @@ def humedad_por_alcaldia(
             return "ALTA — conviene inspección"
         if n >= 10:
             return "MEDIA — monitorear"
-        return "BAJA"
+        if n >= 1:
+            return "BAJA — señales puntuales"
+        return "SIN SEÑALES SAR"
 
     out["prioridad"] = out["humedades_anomalas"].map(_prio)
     return out.reset_index(drop=True)
@@ -596,12 +652,25 @@ def main() -> None:
                     "(0 filas). Hay que volver a correr el ETL Sentinel-1."
                 )
         else:
-            st.warning(
-                "Hay `SUPABASE_DB_URL`, pero la consulta a la base falló. "
-                "Revisa el Secret (sin saltos raros) y que sea el mismo proyecto de Supabase."
+            st.error(
+                "Hay `SUPABASE_DB_URL`, pero **la base no responde**. "
+                "Sin esa conexión no hay puntos morados (SAR solo vive en Supabase; pozos/REPDA sí salen del CSV)."
             )
-            with st.expander("Detalle técnico del error de conexión"):
-                st.code(probe["error"][:1500] if probe["error"] else "(sin detalle)")
+            err = (probe.get("error") or "").strip()
+            if err:
+                st.code(err[:1200])
+            st.markdown(
+                """
+                **Cómo arreglarlo (2 minutos):**
+                1. Supabase → tu proyecto → **Connect** → **URI** (Session pooler o Direct).
+                2. Pega la URI con tu contraseña real (sin `[YOUR-PASSWORD]`).
+                3. Streamlit Cloud → **Settings → Secrets** → reemplaza `SUPABASE_DB_URL` completo.
+                4. **Reboot app**.
+
+                Si el error dice `tenant/user ... not found`, la URI es de otro proyecto o el pooler
+                ya no reconoce ese `postgres.xxxxx` — genera una URI nueva desde Connect.
+                """
+            )
     else:
         st.caption(
             "Fuente de datos: **CSV local**. "
