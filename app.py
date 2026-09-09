@@ -24,10 +24,48 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-      .block-container { padding-top: 1.05rem; }
-      h1, h2, h3 { font-family: Georgia, serif; color: #0b3c4d; }
-      div[data-testid="stMetricValue"] { color: #0b3c4d; }
+      :root {
+        --z-ink: #0b3c4d;
+        --z-card: #132238;
+        --z-border: #1e3a5f;
+        --z-muted: #8aa4bd;
+        --z-accent: #a855f7;
+      }
+      .block-container { padding-top: 1.05rem; padding-bottom: 2rem; max-width: 1400px; }
+      h1, h2, h3 { font-family: Georgia, "Iowan Old Style", serif; color: var(--z-ink); }
+      div[data-testid="stMetricValue"] { color: var(--z-ink); }
       .hint { color: #4a5c63; font-size: 0.92rem; }
+      .z-scoreboard {
+        display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px;
+        margin: 0.35rem 0 0.9rem 0;
+      }
+      .z-card {
+        background: var(--z-card); border: 1px solid var(--z-border); border-radius: 12px;
+        padding: 12px 14px; color: #e8f1fa; min-height: 78px;
+      }
+      .z-card .lbl {
+        font-size: 0.68rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--z-muted);
+      }
+      .z-card .val { font-size: 1.35rem; font-weight: 700; margin-top: 4px; color: #f8fafc; }
+      .z-card .sub { font-size: 0.72rem; color: #94a3b8; margin-top: 2px; }
+      .z-pipa {
+        border-radius: 12px; padding: 12px 14px; margin-bottom: 8px; border: 1px solid #334155;
+        background: #0f172a; color: #e2e8f0;
+      }
+      .z-pipa.ok { border-color: #16a34a; box-shadow: inset 3px 0 0 #22c55e; }
+      .z-pipa.warn { border-color: #ca8a04; box-shadow: inset 3px 0 0 #eab308; }
+      .z-pipa.bad { border-color: #dc2626; box-shadow: inset 3px 0 0 #ef4444; }
+      .z-pipa .title { font-weight: 650; font-size: 0.95rem; }
+      .z-pipa .meta { font-size: 0.8rem; color: #94a3b8; margin-top: 2px; }
+      @media (max-width: 768px) {
+        .block-container { padding-left: 0.7rem !important; padding-right: 0.7rem !important; }
+        .z-scoreboard { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+        .z-card .val { font-size: 1.15rem; }
+        div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 0.35rem !important; }
+        div[data-testid="column"] { width: 100% !important; min-width: 100% !important; flex: 1 1 100% !important; }
+        /* En móvil, filtros en 2 columnas táctiles cuando Streamlit los apila por filas */
+        section.main .stMarkdown, section.main .stDataFrame { overflow-x: auto; }
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -58,6 +96,89 @@ def consejo_pipero(nivel: str) -> str:
     if n == "RECUPERACION_O_ESTABLE":
         return "Preferible (menos estrés)"
     return "Dato insuficiente"
+
+
+def norm_alcaldia(series: pd.Series) -> pd.Series:
+    """Normaliza nombres de alcaldía para matching B2G (strip + lower + sin acentos simples)."""
+    s = series.fillna("").astype(str).str.strip().str.lower()
+    repl = (
+        ("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u"),
+        ("ü", "u"), ("ñ", "n"),
+    )
+    for a, b in repl:
+        s = s.str.replace(a, b, regex=False)
+    return s.str.replace(r"\s+", " ", regex=True)
+
+
+def map_height_responsive() -> int:
+    """Altura del mapa: más baja en móvil para no bloquear el scroll táctil."""
+    try:
+        # st.context.headers existe en Streamlit recientes
+        ua = str(st.context.headers.get("User-Agent", "")).lower()  # type: ignore[attr-defined]
+        if any(x in ua for x in ("iphone", "android", "mobile", "ipad")):
+            return 380
+    except Exception:
+        pass
+    return 560
+
+
+def enrich_sar_pfs(smap: pd.DataFrame) -> pd.DataFrame:
+    """
+    PFS (Pipe Failure Score) 0–100 sobre puntos SAR filtrados.
+    PFS = min(100, round(|delta_db|/10 * 50 + max(0, 1 - dist_m/2000) * 50))
+    """
+    out = smap.copy()
+    delta_col = next((c for c in ("delta_db", "delta_db", "delta_db") if c in out.columns), None)
+    dist_col = next(
+        (c for c in ("dist_pozo_critico_m", "dist_pozo_critico_m", "dist_pozo_critico_m") if c in out.columns),
+        None,
+    )
+    bs_col = next((c for c in ("backscatter_db", "backscatter_db", "backscatter_db") if c in out.columns), None)
+    delta = (
+        pd.to_numeric(out[delta_col], errors="coerce").fillna(0.0).abs()
+        if delta_col is not None
+        else pd.Series(0.0, index=out.index)
+    )
+    dist = (
+        pd.to_numeric(out[dist_col], errors="coerce").fillna(2000.0).clip(lower=0)
+        if dist_col is not None
+        else pd.Series(2000.0, index=out.index)
+    )
+    pfs = ((delta / 10.0) * 50.0 + (1.0 - (dist / 2000.0)).clip(lower=0) * 50.0).round().clip(upper=100)
+    out["pfs"] = pfs.astype(int)
+    out["delta_db_tip"] = delta.round(2)
+    out["dist_pozo_m_tip"] = dist.round(0).astype(int)
+    out["backscatter_tip"] = (
+        pd.to_numeric(out[bs_col], errors="coerce").round(1)
+        if bs_col is not None
+        else pd.Series([pd.NA] * len(out), index=out.index)
+    )
+    out["fill_color"] = out["pfs"].map(
+        lambda v: [239, 68, 68, 200] if int(v) >= 70 else [168, 85, 247, 160]
+    )
+    out["line_color"] = out["pfs"].map(
+        lambda v: [254, 202, 202, 220] if int(v) >= 70 else [233, 213, 255, 200]
+    )
+    out["radius"] = 45
+    return out
+
+
+def scoreboard_html(cards: list[tuple[str, str, str]]) -> str:
+    """Tarjetas ejecutivas oscuras (#132238 / #1e3a5f)."""
+    cells = []
+    for lbl, val, sub in cards:
+        cells.append(
+            f'<div class="z-card"><div class="lbl">{lbl}</div>'
+            f'<div class="val">{val}</div><div class="sub">{sub}</div></div>'
+        )
+    return f'<div class="z-scoreboard">{"".join(cells)}</div>'
+
+
+def pipero_card_html(titulo: str, meta: str, kind: str = "ok") -> str:
+    return (
+        f'<div class="z-pipa {kind}"><div class="title">{titulo}</div>'
+        f'<div class="meta">{meta}</div></div>'
+    )
 
 
 def get_db_url() -> str | None:
@@ -407,7 +528,12 @@ def humedad_por_alcaldia(
         keep = [c for c in ["alcaldia", "score_severidad_max", "nivel_riesgo_estructural"] if c in meta.columns]
         if len(keep) > 1:
             meta = meta[keep].drop_duplicates("alcaldia")
-            out = out.merge(meta, on="alcaldia", how="left", suffixes=("", "_diag"))
+            out = out.copy()
+            out["_k"] = norm_alcaldia(out["alcaldia"])
+            meta["_k"] = norm_alcaldia(meta["alcaldia"])
+            meta = meta.drop(columns=["alcaldia"])
+            out = out.merge(meta, on="_k", how="left", suffixes=("", "_diag"))
+            out = out.drop(columns=["_k"], errors="ignore")
             if "score_severidad_max_diag" in out.columns:
                 out["score_severidad_max"] = out["score_severidad_max"].fillna(out["score_severidad_max_diag"])
                 out = out.drop(columns=["score_severidad_max_diag"])
@@ -439,8 +565,8 @@ def humedad_por_alcaldia(
         )
 
     if alcaldias_filtro:
-        # No descartar filas SAR si el nombre no matchea el filtro; filtrar solo si hay overlap
-        matched = out[out["alcaldia"].isin(alcaldias_filtro)]
+        keys = set(norm_alcaldia(pd.Series(list(alcaldias_filtro))))
+        matched = out[norm_alcaldia(out["alcaldia"]).isin(keys)]
         if len(matched):
             out = matched
 
@@ -840,20 +966,22 @@ def main() -> None:
     sar_count = int(len(sar_map)) if len(sar_map) else 0
     score_max = float(salud_map["score_severidad_fuga"].max()) if len(salud_map) and "score_severidad_fuga" in salud_map.columns else 0.0
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Déficit acuíferos (CDMX)", f"{deficit:,.0f} hm³/año", help="Suma de déficit de acuíferos que tocan la ciudad.")
-    c2.metric("Agua concesionada (filtro)", f"{repda_hm3:,.1f} hm³/año", help="Según el filtro actual (ámbito/alcaldía/colonia).")
-    c3.metric("Pozos críticos (filtro)", f"{piezo_critico}")
-    c4.metric("Títulos REPDA (filtro)", f"{n_titles}")
-    c5.metric(
-        "Puntos SAR / humedad",
-        f"{sar_count}",
-        help="Círculos morados en el mapa. Si ves 0 con filtro de alcaldía, suele ser desajuste de nombres; el mapa usa también ubicación geográfica.",
+    st.markdown(
+        scoreboard_html(
+            [
+                ("Déficit acuíferos CDMX", f"{deficit:,.0f} hm³/año", "CONAGUA · estructura"),
+                ("Agua concesionada", f"{repda_hm3:,.1f} hm³/año", "REPDA · filtro actual"),
+                ("Pozos críticos", f"{piezo_critico}", "Abatimiento ALTO"),
+                ("Títulos REPDA", f"{n_titles}", "Derechos formales"),
+                ("Señales SAR", f"{sar_count}", "Humedad anómala · mapa"),
+            ]
+        ),
+        unsafe_allow_html=True,
     )
     if piezo_critico:
         st.caption(
             f"Hay **{piezo_critico} pozos críticos (ALTO)** en el filtro: "
-            "abajo en Torre de control aparece la tabla con alcaldía y recomendación más cercana."
+            "el detalle técnico queda en pestañas al final (no bloquea la sala de situación)."
         )
     if score_max > 0:
         st.caption(f"Score máximo de severidad de fuga (filtro): **{score_max:.0f}/100**")
@@ -991,45 +1119,27 @@ def main() -> None:
     if sel and sel != "(Ver mapa del filtro actual)":
         st.session_state.pozo_sel = int(sel.split("·")[0].strip())
 
-    # Tabla operativa de pozos críticos (siempre visible para atención)
+    # Detalle de pozos críticos se muestra al final (pestañas), no antes del mapa
     crit_tabla = enrich_critical_wells(pie_mapa if len(pie_mapa) else pie)
-    if len(crit_tabla):
-        st.markdown("#### Pozos críticos (abatimiento ALTO) — atención prioritaria")
-        st.caption("Lista accionable para gobernación: dónde duele + alternativa preferible más cercana.")
-        crit_view = crit_tabla[
-            [c for c in [
-                "num_pozo", "colonia", "alcaldia", "tasa_abatimiento_m_anio",
-                "semaforo", "recomendacion_cercana", "dist_recomendacion_km", "latitud", "longitud",
-            ] if c in crit_tabla.columns]
-        ].rename(columns={
-            "num_pozo": "No. pozo",
-            "colonia": "Colonia",
-            "alcaldia": "Alcaldía",
-            "tasa_abatimiento_m_anio": "Bajada (m/año)",
-            "semaforo": "Semáforo",
-            "recomendacion_cercana": "Recomendación más cercana",
-            "dist_recomendacion_km": "Dist. km",
-            "latitud": "Lat",
-            "longitud": "Lon",
-        })
-        st.dataframe(crit_view, use_container_width=True, hide_index=True, height=260)
 
     left, right = st.columns([1.65, 1], gap="large")
+    hum = pd.DataFrame()  # se llena en el panel derecho; disponible para pestañas B2G
 
     with left:
         st.markdown("### Mapa")
         st.caption(
-            "**Morado = humedad anómala (alerta de inspección).** "
-            "Hoy el satélite está cargado sobre el **Corredor Poniente** (oeste), no sobre las 16 alcaldías. "
-            "Al pasar el mouse sobre humedad o pozo crítico verás los **3 pozos ALTO más cercanos**."
+            "**Morado = humedad anómala · Rojo fuego = PFS ≥ 70 (prioridad de inspección).** "
+            "Hoy el satélite cubre sobre todo el **Corredor Poniente**. "
+            "Tooltip: alcaldía, PFS, Δ dB y distancia al pozo crítico."
         )
         with st.expander("Leyenda (plática con alcaldías)", expanded=False):
             st.markdown(
                 """
                 | Color | Significa |
                 |---|---|
-                | **Morado** | Humedad anómala Sentinel-1 (alerta de inspección, no fuga confirmada) |
-                | **Rojo** | Pozo abatimiento ALTO |
+                | **Morado** | Humedad anómala Sentinel-1 (PFS &lt; 70) — alerta de inspección |
+                | **Rojo fuego** | PFS ≥ 70 — prioridad alta de inspección de red |
+                | **Rojo (pozo)** | Pozo abatimiento ALTO |
                 | **Naranja** | Pozo MEDIO |
                 | **Verde / teal** | Pozo leve o estable |
                 | **Anillo** | Concesión REPDA (derecho legal de extracción) |
@@ -1141,25 +1251,28 @@ def main() -> None:
 
         if mostrar_sar and len(sar_vista) and {"latitud", "longitud"}.issubset(sar_vista.columns):
             smap = sar_vista.dropna(subset=["latitud", "longitud"]).copy()
-            # Si tras filtros queda vacío, mostrar SAR del ámbito sin filtro de nombre
             if smap.empty and len(sar_map):
                 smap = sar_map.dropna(subset=["latitud", "longitud"]).copy()
-            smap["radius"] = 180
-            smap["tip_titulo"] = "Humedad anómala (alerta de inspección)"
+            smap = enrich_sar_pfs(smap)
+            if "colonia" not in smap.columns:
+                smap["colonia"] = ""
+            smap["tip_titulo"] = smap["pfs"].map(
+                lambda v: f"SAR · PFS {int(v)}/100" + (" · ALERTA ALTA" if int(v) >= 70 else "")
+            )
             smap["tip_linea1"] = smap.apply(
-                lambda r: f"{r.get('alcaldia', '')} · {r.get('fecha_escena', '')}".strip(" ·"),
+                lambda r: f"{r.get('alcaldia', '')} · {r.get('colonia', '')}".strip(" ·"),
                 axis=1,
             )
             smap["tip_linea2"] = smap.apply(
                 lambda r: (
-                    f"Backscatter {float(r['backscatter_db']):.1f} dB · Δ {float(r['delta_db']):.1f} dB"
-                    if pd.notna(r.get("backscatter_db")) and pd.notna(r.get("delta_db"))
-                    else "Señal dieléctrica anómala"
+                    f"Δ {float(r['delta_db_tip']):.1f} dB"
+                    + (f" · σ0 {float(r['backscatter_tip']):.1f} dB" if pd.notna(r.get('backscatter_tip')) else "")
+                    + f" · pozo crítico a {int(r['dist_pozo_m_tip'])} m"
                 ),
                 axis=1,
             )
             smap["tip_linea3"] = smap.apply(
-                lambda r: "3 pozos críticos cercanos: " + nearest_points_text(
+                lambda r: "Vecinos ALTO: " + nearest_points_text(
                     float(r["latitud"]), float(r["longitud"]), criticos_pool, n=3
                 ),
                 axis=1,
@@ -1171,10 +1284,10 @@ def main() -> None:
                     id="sar",
                     get_position="[longitud, latitud]",
                     get_radius="radius",
-                    radius_min_pixels=6,
-                    radius_max_pixels=28,
-                    get_fill_color="[168, 85, 247, 220]",  # morado
-                    get_line_color="[233, 213, 255, 255]",
+                    radius_min_pixels=3,
+                    radius_max_pixels=14,
+                    get_fill_color="fill_color",
+                    get_line_color="line_color",
                     line_width_min_pixels=1,
                     stroked=True,
                     filled=True,
@@ -1229,7 +1342,7 @@ def main() -> None:
                 },
             ),
             use_container_width=True,
-            height=560,
+            height=map_height_responsive(),
             on_select="rerun",
             selection_mode="single-object",
             key="mapa_cdmx",
@@ -1267,10 +1380,16 @@ def main() -> None:
         )
         if len(hum):
             top = hum.iloc[0]
-            st.warning(
-                f"**Prioridad sugerida:** {top['alcaldia']} — "
-                f"**{int(top['humedades_anomalas'])}** señales de humedad anómala. "
-                f"{top.get('prioridad', '')}"
+            total_h = int(hum["humedades_anomalas"].sum())
+            st.markdown(
+                scoreboard_html(
+                    [
+                        ("Señales en foco", f"{total_h}", "conteo SAR real"),
+                        ("Alcaldía prioridad", str(top["alcaldia"])[:22], str(top.get("prioridad", ""))[:28]),
+                        ("Máx. en una alcaldía", f"{int(top['humedades_anomalas'])}", "puntos"),
+                    ]
+                ),
+                unsafe_allow_html=True,
             )
             hum_view = hum.rename(
                 columns={
@@ -1281,23 +1400,24 @@ def main() -> None:
                     "prioridad": "Prioridad de revisión",
                 }
             )
-            st.dataframe(hum_view, use_container_width=True, hide_index=True, height=280)
-            st.markdown(
-                """
-                **Frase lista para alcaldía:**  
-                *“Detectamos N señales de humedad anómala en su territorio. 
-                No es lluvia ni sequía del semáforo oficial: es posible pérdida de agua en red. 
-                ZASEVA ayuda a localizar, priorizar y coordinar la logística de solución.”*
-                """.replace("N", str(int(hum["humedades_anomalas"].sum())))
-            )
-            if "No. humedades anómalas" in hum_view.columns:
-                chart_df = hum_view.head(8).copy()
+            chart_df = hum_view.head(8).copy()
+            if "No. humedades anómalas" in chart_df.columns:
                 st.bar_chart(
                     chart_df,
                     x="Alcaldía / municipio",
                     y="No. humedades anómalas",
                     horizontal=True,
                 )
+            with st.expander("Tabla detallada por alcaldía", expanded=False):
+                st.dataframe(hum_view, use_container_width=True, hide_index=True, height=280)
+            st.markdown(
+                """
+                **Frase lista para alcaldía:**  
+                *“Detectamos N señales de humedad anómala en su territorio. 
+                No es lluvia ni sequía del semáforo oficial: es posible pérdida de agua en red. 
+                ZASEVA ayuda a localizar, priorizar y coordinar la logística de solución.”*
+                """.replace("N", str(total_h))
+            )
         else:
             st.info(
                 "Aún no hay conteo de humedad anómala por alcaldía. "
@@ -1357,14 +1477,39 @@ def main() -> None:
                 st.write("Sin títulos.")
 
     st.divider()
-    st.markdown("### Diagnóstico B2G — alcaldías (Sentinel-1 × acuífero × pozos)")
-    st.caption(
-        "Vista para plática con municipios: fugas invisibles, déficit del acuífero y riesgo estructural de red. "
-        "Se alimenta de `vista_diagnostico_alcaldia_resumen` en Supabase."
+    st.markdown("### Inspección municipal · detalle técnico")
+    st.caption("El mapa y el scoreboard ya dieron el mensaje ejecutivo. Aquí va la evidencia accionable.")
+
+    tab_sar, tab_pozos, tab_repda, tab_piperos = st.tabs(
+        ["Inspección SAR", "Auditoría de pozos", "Concesiones REPDA", "Módulo piperos"]
     )
-    if len(diagnostico):
-        diag_view = diagnostico.rename(
-            columns={
+
+    with tab_sar:
+        st.markdown("#### Diagnóstico B2G — alcaldías (Sentinel-1 × acuífero × pozos)")
+        st.caption(
+            "Vista para plática con municipios. Los conteos del panel lateral salen del SAR real; "
+            "esta tabla aporta contexto de acuífero/riesgo estructural."
+        )
+        if len(diagnostico):
+            diag = diagnostico.copy()
+            if "hum" in dir() and len(hum) and "alcaldia" in hum.columns and "alcaldia" in diag.columns:
+                h2 = hum.copy()
+                h2["_k"] = norm_alcaldia(h2["alcaldia"])
+                diag["_k"] = norm_alcaldia(diag["alcaldia"])
+                diag = diag.merge(
+                    h2[["_k", "humedades_anomalas"]].rename(columns={"humedades_anomalas": "fugas_sar_reales"}),
+                    on="_k",
+                    how="left",
+                )
+                if "puntos_criticos_fugas" in diag.columns:
+                    diag["puntos_criticos_fugas"] = (
+                        pd.to_numeric(diag["fugas_sar_reales"], errors="coerce")
+                        .fillna(pd.to_numeric(diag["puntos_criticos_fugas"], errors="coerce"))
+                        .fillna(0)
+                        .astype(int)
+                    )
+                diag = diag.drop(columns=["_k", "fugas_sar_reales"], errors="ignore")
+            rename_diag = {
                 "alcaldia": "Alcaldía",
                 "puntos_criticos_fugas": "Puntos críticos fugas",
                 "deficit_acuifero_hm3_promedio": "Déficit acuífero (hm³)",
@@ -1373,80 +1518,57 @@ def main() -> None:
                 "nivel_riesgo_estructural": "Riesgo estructural",
                 "n_colonias": "Colonias",
             }
-        )
-        st.dataframe(diag_view, use_container_width=True, hide_index=True)
-    elif db_ok:
-        st.info(
-            "Supabase está configurado, pero aún no hay filas en el diagnóstico SAR. "
-            "Corre el ETL satelital y recarga la app."
-        )
-    else:
-        st.info(
-            "Para ver este bloque: configura `SUPABASE_DB_URL` en Streamlit Secrets "
-            "y asegúrate de haber corrido el ETL SAR."
-        )
-
-    if len(salud):
-        with st.expander("Detalle de celdas con mayor score de severidad", expanded=False):
-            top = salud.head(25).rename(
-                columns={
-                    "colonia": "Colonia",
-                    "alcaldia": "Alcaldía",
-                    "score_severidad_fuga": "Score fuga",
-                    "nivel_riesgo_red": "Riesgo",
-                    "score_sar_humedad": "Score SAR",
-                    "score_abatimiento": "Score abatimiento",
-                    "deficit_acui_hm3": "Déficit hm³",
-                    "fecha_calculo": "Fecha",
-                }
+            diag_view = diag.rename(columns={k: v for k, v in rename_diag.items() if k in diag.columns})
+            st.dataframe(diag_view, use_container_width=True, hide_index=True)
+        elif db_ok:
+            st.info(
+                "Supabase está configurado, pero aún no hay filas en el diagnóstico SAR. "
+                "Corre el ETL satelital y recarga la app."
             )
-            st.dataframe(top, use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.markdown("### Para piperos — guía del filtro actual")
-    st.caption("Proxy de estrés del nivel freático (no es medidor de tanque lleno en vivo).")
-
-    preferir = pie_series[pie_series["nivel_estres"].isin(["RECUPERACION_O_ESTABLE", "LEVE"])].sort_values(
-        "tasa_abatimiento_m_anio"
-    ) if len(pie_series) else pie.head(0)
-    evitar = pie_series[pie_series["nivel_estres"] == "ALTO"].sort_values(
-        "tasa_abatimiento_m_anio", ascending=False
-    ) if len(pie_series) else pie.head(0)
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("#### ✅ Más preferibles")
-        if len(preferir):
-            st.dataframe(
-                piezo_table_view(preferir.head(8)),
-                use_container_width=True,
-                hide_index=True,
-            )
-            best = preferir.iloc[0]
-            if st.button(f"Enfocar pozo {int(best['num_pozo'])}", key="btn_best"):
-                st.session_state.pozo_sel = int(best["num_pozo"])
-                st.rerun()
         else:
-            st.write("No hay pozos ‘preferibles’ en este filtro.")
-
-    with col_b:
-        st.markdown("#### ⛔ Más críticos")
-        if len(evitar):
-            st.dataframe(
-                piezo_table_view(evitar.head(8)),
-                use_container_width=True,
-                hide_index=True,
+            st.info(
+                "Para ver este bloque: configura `SUPABASE_DB_URL` en Streamlit Secrets "
+                "y asegúrate de haber corrido el ETL SAR."
             )
-            worst = evitar.iloc[0]
-            if st.button(f"Enfocar pozo {int(worst['num_pozo'])}", key="btn_worst"):
-                st.session_state.pozo_sel = int(worst["num_pozo"])
-                st.rerun()
-        else:
-            st.write("No hay pozos críticos en este filtro.")
+        if len(salud):
+            with st.expander("Detalle de celdas con mayor score de severidad", expanded=False):
+                top = salud.head(25).rename(
+                    columns={
+                        "colonia": "Colonia",
+                        "alcaldia": "Alcaldía",
+                        "score_severidad_fuga": "Score fuga",
+                        "nivel_riesgo_red": "Riesgo",
+                        "score_sar_humedad": "Score SAR",
+                        "score_abatimiento": "Score abatimiento",
+                        "deficit_acui_hm3": "Déficit hm³",
+                        "fecha_calculo": "Fecha",
+                    }
+                )
+                st.dataframe(top, use_container_width=True, hide_index=True)
 
-    st.divider()
-    t1, t2 = st.tabs(["Pozos del filtro", "Títulos REPDA del filtro"])
-    with t1:
+    with tab_pozos:
+        st.markdown("#### Pozos críticos (abatimiento ALTO)")
+        if len(crit_tabla):
+            crit_view = crit_tabla[
+                [c for c in [
+                    "num_pozo", "colonia", "alcaldia", "tasa_abatimiento_m_anio",
+                    "semaforo", "recomendacion_cercana", "dist_recomendacion_km", "latitud", "longitud",
+                ] if c in crit_tabla.columns]
+            ].rename(columns={
+                "num_pozo": "No. pozo",
+                "colonia": "Colonia",
+                "alcaldia": "Alcaldía",
+                "tasa_abatimiento_m_anio": "Bajada (m/año)",
+                "semaforo": "Semáforo",
+                "recomendacion_cercana": "Recomendación más cercana",
+                "dist_recomendacion_km": "Dist. km",
+                "latitud": "Lat",
+                "longitud": "Lon",
+            })
+            st.dataframe(crit_view, use_container_width=True, hide_index=True, height=320)
+        else:
+            st.write("Sin pozos críticos en este filtro.")
+        st.markdown("#### Todos los pozos del filtro")
         if len(pie_series):
             full = pie_series.sort_values("tasa_abatimiento_m_anio", ascending=False)
             full_view = piezo_table_view(full, include_coords=True)
@@ -1467,7 +1589,7 @@ def main() -> None:
         else:
             st.write("Sin pozos para este filtro.")
 
-    with t2:
+    with tab_repda:
         if len(titles):
             tfilt = titles.copy()
             if ambito == "Corredor Poniente" and "en_poniente" in tfilt.columns:
@@ -1476,7 +1598,7 @@ def main() -> None:
                 tfilt = tfilt[tfilt["alcaldia"].isin(seleccion_alcaldias)]
             if filtro_colonias_activo and "colonia" in tfilt.columns:
                 tfilt = tfilt[tfilt["colonia"].isin(colonia_sel_rows["colonia"].unique())]
-            top = tfilt.sort_values("volumen_m3_anio", ascending=False).head(15)
+            top = tfilt.sort_values("volumen_m3_anio", ascending=False).head(25)
             st.dataframe(
                 pd.DataFrame(
                     {
@@ -1493,6 +1615,65 @@ def main() -> None:
             )
         else:
             st.write("Sin títulos para este filtro.")
+
+    with tab_piperos:
+        st.markdown("#### Semáforo operativo para carga")
+        st.caption("Proxy de estrés del nivel freático (no es medidor de tanque lleno en vivo).")
+        preferir = (
+            pie_series[pie_series["nivel_estres"].isin(["RECUPERACION_O_ESTABLE", "LEVE"])]
+            .sort_values("tasa_abatimiento_m_anio")
+            if len(pie_series)
+            else pie.head(0)
+        )
+        evitar = (
+            pie_series[pie_series["nivel_estres"] == "ALTO"]
+            .sort_values("tasa_abatimiento_m_anio", ascending=False)
+            if len(pie_series)
+            else pie.head(0)
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("##### Preferibles (menor estrés)")
+            if len(preferir):
+                cards = []
+                for _, r in preferir.head(6).iterrows():
+                    cards.append(
+                        pipero_card_html(
+                            f"Pozo {int(r['num_pozo'])} · {r.get('colonia', '')}",
+                            f"{r.get('alcaldia', '')} · {r.get('semaforo', '')} · "
+                            f"{float(r.get('tasa_abatimiento_m_anio', 0) or 0):.2f} m/año · "
+                            f"{r.get('consejo_para_piperos', '')}",
+                            "ok",
+                        )
+                    )
+                st.markdown("".join(cards), unsafe_allow_html=True)
+                best = preferir.iloc[0]
+                if st.button(f"Enfocar pozo {int(best['num_pozo'])}", key="btn_best"):
+                    st.session_state.pozo_sel = int(best["num_pozo"])
+                    st.rerun()
+            else:
+                st.write("No hay pozos preferibles en este filtro.")
+        with col_b:
+            st.markdown("##### Críticos (evitar si hay alternativa)")
+            if len(evitar):
+                cards = []
+                for _, r in evitar.head(6).iterrows():
+                    cards.append(
+                        pipero_card_html(
+                            f"Pozo {int(r['num_pozo'])} · {r.get('colonia', '')}",
+                            f"{r.get('alcaldia', '')} · {r.get('semaforo', '')} · "
+                            f"{float(r.get('tasa_abatimiento_m_anio', 0) or 0):.2f} m/año · "
+                            f"{r.get('consejo_para_piperos', '')}",
+                            "bad",
+                        )
+                    )
+                st.markdown("".join(cards), unsafe_allow_html=True)
+                worst = evitar.iloc[0]
+                if st.button(f"Enfocar pozo {int(worst['num_pozo'])}", key="btn_worst"):
+                    st.session_state.pozo_sel = int(worst["num_pozo"])
+                    st.rerun()
+            else:
+                st.write("No hay pozos críticos en este filtro.")
 
     with st.expander("Notas y límites de esta versión"):
         st.markdown(
