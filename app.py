@@ -17,6 +17,8 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 LOGO_PATH = ASSETS_DIR / "zaseva_logo.png"
 MARK_PATH = ASSETS_DIR / "zaseva_mark.png"
+LOGO_CLEAR_PATH = ASSETS_DIR / "zaseva_logo_clear.png"
+MARK_CLEAR_PATH = ASSETS_DIR / "zaseva_mark_clear.png"
 
 st.set_page_config(
     page_title="ZASEVA · Inteligencia Hídrica",
@@ -56,15 +58,57 @@ st.markdown(
       [data-testid="stDataFrame"], [data-testid="stTable"] {
         background: var(--z-panel); border: 1px solid var(--z-border); border-radius: 12px;
       }
-      .stTabs [data-baseweb="tab-list"] { gap: 8px; border-bottom: 1px solid #1e293b; }
+      .stTabs [data-baseweb="tab-list"] { gap: 10px; border-bottom: 1px solid #1e293b; }
       .stTabs [data-baseweb="tab"] {
-        background: #0f172a; color: #cbd5e1; border-radius: 10px 10px 0 0;
-        border: 1px solid #1e293b; padding: 8px 14px;
+        background: #0f172a; color: #cbd5e1; border-radius: 12px 12px 0 0;
+        border: 1px solid #334155; padding: 10px 16px;
+        transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
       }
+      .stTabs [data-baseweb="tab"]:hover {
+        transform: translateY(-2px) scale(1.03);
+        box-shadow: 0 8px 18px rgba(0,0,0,0.35);
+        color: #fff !important;
+      }
+      .stTabs [data-baseweb="tab"]:nth-child(1) { border-color: #7c3aed; }
+      .stTabs [data-baseweb="tab"]:nth-child(2) { border-color: #dc2626; }
+      .stTabs [data-baseweb="tab"]:nth-child(3) { border-color: #2563eb; }
+      .stTabs [data-baseweb="tab"]:nth-child(4) { border-color: #16a34a; }
       .stTabs [aria-selected="true"] {
-        background: linear-gradient(180deg, #1d4ed8 0%, #1e3a8a 100%) !important;
-        color: #fff !important; border-color: #2563eb !important;
+        color: #fff !important;
+        transform: translateY(-1px) scale(1.02);
       }
+      .stTabs [data-baseweb="tab"]:nth-child(1)[aria-selected="true"] {
+        background: linear-gradient(180deg, #7c3aed 0%, #5b21b6 100%) !important; border-color: #a78bfa !important;
+      }
+      .stTabs [data-baseweb="tab"]:nth-child(2)[aria-selected="true"] {
+        background: linear-gradient(180deg, #dc2626 0%, #991b1b 100%) !important; border-color: #fca5a5 !important;
+      }
+      .stTabs [data-baseweb="tab"]:nth-child(3)[aria-selected="true"] {
+        background: linear-gradient(180deg, #2563eb 0%, #1e3a8a 100%) !important; border-color: #93c5fd !important;
+      }
+      .stTabs [data-baseweb="tab"]:nth-child(4)[aria-selected="true"] {
+        background: linear-gradient(180deg, #16a34a 0%, #166534 100%) !important; border-color: #86efac !important;
+      }
+      .z-logo-shell {
+        display:flex; align-items:center; gap:10px;
+        background: rgba(0,0,0,0.35); border: 1px solid #1e293b;
+        border-radius: 16px; padding: 10px 14px; max-width: 280px;
+      }
+      .z-wordmark {
+        font-size: 1.55rem; font-weight: 700; letter-spacing: -0.03em;
+        color: #f3efe6; line-height: 1;
+      }
+      .z-source {
+        margin-top: 8px; font-size: 0.72rem; color: #7f93a8; line-height: 1.35;
+        max-width: 720px;
+      }
+      .z-bars { display:flex; flex-direction:column; gap:8px; margin: 8px 0 14px 0; }
+      .z-bar-row { display:grid; grid-template-columns: 118px 1fr 52px; gap:8px; align-items:center; }
+      .z-bar-label { font-size:0.78rem; color:#cbd5e1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      .z-bar-track { height:12px; background:#0f172a; border:1px solid #1e293b; border-radius:999px; overflow:hidden; }
+      .z-bar-fill { height:100%; border-radius:999px; }
+      .z-bar-val { font-size:0.78rem; color:#e2e8f0; text-align:right; font-weight:600; }
+      .z-search-hint { font-size:0.8rem; color:#94a3b8; margin: 0 0 8px 0; }
       .z-hero {
         display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap;
         margin: 0 0 14px 0; padding: 10px 4px 4px 4px;
@@ -254,6 +298,33 @@ def section_banner(title: str, subtitle: str) -> str:
 
 def explain_box(text: str) -> str:
     return f'<div class="z-explain">{text}</div>'
+
+def humidity_bars_html(df: pd.DataFrame, label_col: str, value_col: str, *, top_n: int = 8) -> str:
+    """Barras lean: tono suave = pocas señales; tono intenso = más críticas."""
+    if df is None or getattr(df, "empty", True) or value_col not in df.columns:
+        return ""
+    view = df.head(top_n).copy()
+    vals = pd.to_numeric(view[value_col], errors="coerce").fillna(0)
+    vmax = float(vals.max()) if len(vals) else 1.0
+    vmax = vmax if vmax > 0 else 1.0
+    rows = []
+    for _, r in view.iterrows():
+        name = str(r.get(label_col, ""))
+        val = float(pd.to_numeric(r.get(value_col), errors="coerce") or 0)
+        t = val / vmax
+        # azul suave → rojo intenso
+        c0, c1 = (59, 130, 246), (220, 38, 38)
+        rgb = tuple(int(a + (b - a) * t) for a, b in zip(c0, c1))
+        color = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+        width = max(4.0, 100.0 * t)
+        rows.append(
+            f'<div class="z-bar-row"><div class="z-bar-label" title="{name}">{name}</div>'
+            f'<div class="z-bar-track"><div class="z-bar-fill" style="width:{width:.1f}%;background:{color};"></div></div>'
+            f'<div class="z-bar-val">{int(val)}</div></div>'
+        )
+    return f'<div class="z-bars">{"".join(rows)}</div>'
+
+
 
 
 def pipero_card_html(titulo: str, meta: str, kind: str = "ok") -> str:
@@ -875,24 +946,31 @@ def load_dashboard_layers() -> dict:
 
 
 def main() -> None:
-    # Header de marca (logo + propuesta de valor)
-    c_logo, c_copy = st.columns([1.1, 2.4], gap="large")
+    # Header lean: marca limpia + Torre de Control (lenguaje para alcaldía)
+    c_logo, c_copy = st.columns([0.85, 2.6], gap="medium")
     with c_logo:
-        if LOGO_PATH.exists():
-            st.image(str(LOGO_PATH), use_container_width=True)
-        elif MARK_PATH.exists():
-            st.image(str(MARK_PATH), width=120)
+        logo_show = LOGO_CLEAR_PATH if LOGO_CLEAR_PATH.exists() else (LOGO_PATH if LOGO_PATH.exists() else None)
+        mark_show = MARK_CLEAR_PATH if MARK_CLEAR_PATH.exists() else (MARK_PATH if MARK_PATH.exists() else None)
+        if logo_show is not None:
+            st.image(str(logo_show), width=210)
+        elif mark_show is not None:
+            st.markdown('<div class="z-logo-shell">', unsafe_allow_html=True)
+            st.image(str(mark_show), width=42)
+            st.markdown('<div class="z-wordmark">zaseva</div></div>', unsafe_allow_html=True)
         else:
-            st.markdown("### zaseva")
+            st.markdown('<div class="z-wordmark">zaseva</div>', unsafe_allow_html=True)
     with c_copy:
         st.markdown(
             """
             <div class="z-kicker">Centro de inteligencia hídrica · CDMX</div>
-            <h2 style="margin:0 0 6px 0;">Sala de situación para decisión B2G</h2>
+            <h2 style="margin:0 0 4px 0;">Torre de Control Zaseva</h2>
             <p class="hint" style="margin:0;">
-            Radar Sentinel-1 + pozos oficiales + REPDA en un solo lienzo.
-            Prioriza inspección, conversa con alcaldías y opera la flota con evidencia.
+            Dónde hay humedad anómala, qué pozos están bajo estrés y qué concesiones hay —
+            para decidir inspección y operación con evidencia.
             </p>
+            <div class="z-source">
+              Fuentes: CONAGUA · SACMEX · REPDA &nbsp;·&nbsp; Radar: Sentinel-1 (ESA) &nbsp;·&nbsp; Análisis: Zaseva
+            </div>
             """,
             unsafe_allow_html=True,
         )
@@ -904,7 +982,7 @@ def main() -> None:
             - **Semáforo de pozos:** qué tan rápido baja el nivel del agua.
             - **REPDA:** agua autorizada legalmente (no bombeo en vivo).
             - **SAR / fugas invisibles:** humedad anómala detectada con radar Sentinel-1.
-            - **Prioridad de inspección (0–100):** dónde conviene mandar brigada primero (no es fuga confirmada).
+            - **Prioridad de inspección (0–100):** dónde conviene visitar primero (no es fuga confirmada).
             - **Para piperos:** guía de carga preferible vs evitar (proxy de estrés del pozo, no nivel de tanque).
             """
         )
@@ -1164,10 +1242,10 @@ def main() -> None:
           <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;">
             <div>
               <div style="font-size:0.72rem;letter-spacing:0.14em;text-transform:uppercase;color:#5b9ec9;">
-                ZASEVA · Sala de situación
+                ZASEVA · Torre de control
               </div>
               <div style="font-size:1.15rem;font-weight:650;color:#e8f1fa;margin-top:2px;">
-                Torre de control territorial
+                Mapa operativo
               </div>
             </div>
             <div style="font-size:0.78rem;color:#8aa4bd;">
@@ -1206,14 +1284,20 @@ def main() -> None:
         alc_mapa_opts = sorted(col_cat["alcaldia"].dropna().unique().tolist()) if len(col_cat) else sorted(seleccion_alcaldias)
         if not alc_mapa_opts and seleccion_alcaldias:
             alc_mapa_opts = sorted(seleccion_alcaldias)
+        # Vacío = todas. Si preseleccionamos todas, el menú parece "vacío" y no se entiende.
         alcaldias_mapa = st.multiselect(
-            "Foco alcaldía / municipio",
+            "Mostrar alcaldías en el mapa",
             options=alc_mapa_opts,
-            default=seleccion_alcaldias if seleccion_alcaldias else alc_mapa_opts,
-            help="Deja una sola alcaldía para la reunión con esa gobernación.",
+            default=[],
+            placeholder="Escribe o elige… (vacío = todas)",
+            help="Agrega o quita alcaldías. Si dejas vacío, se muestran todas las del filtro.",
+            key="foco_alcaldias_mapa",
         )
-        if not alcaldias_mapa and alc_mapa_opts:
-            alcaldias_mapa = alc_mapa_opts
+        if not alcaldias_mapa:
+            alcaldias_mapa = list(alc_mapa_opts)
+            st.caption("Viendo **todas** las alcaldías del filtro. Agrega nombres arriba para acotar.")
+        else:
+            st.caption(f"Foco activo: **{', '.join(alcaldias_mapa)}**")
 
     # Asignar alcaldía a pozos si viene vacía (Supabase)
     if len(pie) and (pie.get("alcaldia", pd.Series(dtype=str)).astype(str).str.len().fillna(0) == 0).all():
@@ -1467,7 +1551,15 @@ def main() -> None:
                 "Prueba “Corredor Poniente” o quita filtros de alcaldía estrechos."
             )
 
-        if st.session_state.pozo_sel is not None and len(pmap) and (pmap["num_pozo"] == st.session_state.pozo_sel).any():
+        # Enfoque desde buscador de prioridad (panel humedad / inspección)
+        if st.session_state.get("map_focus") and isinstance(st.session_state.map_focus, dict):
+            mf = st.session_state.map_focus
+            view = pdk.ViewState(
+                latitude=float(mf["lat"]),
+                longitude=float(mf["lon"]),
+                zoom=float(mf.get("zoom", 13.2)),
+            )
+        elif st.session_state.pozo_sel is not None and len(pmap) and (pmap["num_pozo"] == st.session_state.pozo_sel).any():
             row = pmap[pmap["num_pozo"] == st.session_state.pozo_sel].iloc[0]
             view = pdk.ViewState(latitude=float(row.latitud), longitude=float(row.longitud), zoom=13.5)
         elif mostrar_sar and len(sar_vista) and {"latitud", "longitud"}.issubset(sar_vista.columns):
@@ -1534,8 +1626,8 @@ def main() -> None:
     with right:
         st.markdown("### Humedad anómala por alcaldía")
         st.caption(
-            "Conteo de señales SAR (fugas invisibles proxy). "
-            "Más puntos = más urgente revisar la red."
+            "Cada punto morado del mapa es una señal de humedad fuera de lo normal. "
+            "Más señales = más urgente revisar la red."
         )
 
         hum = humedad_por_alcaldia(
@@ -1548,12 +1640,18 @@ def main() -> None:
         if len(hum):
             top = hum.iloc[0]
             total_h = int(hum["humedades_anomalas"].sum())
+            top_n = int(top["humedades_anomalas"])
+            top_alc = str(top["alcaldia"])
             st.markdown(
                 scoreboard_html(
                     [
-                        ("Señales en foco", f"{total_h}", "conteo SAR real del mapa"),
-                        ("Alcaldía prioridad", str(top["alcaldia"]), str(top.get("prioridad", ""))),
-                        ("Máx. en una alcaldía", f"{int(top['humedades_anomalas'])}", "puntos concentrados"),
+                        ("Señales de humedad anómala", f"{total_h}", "total visible en el mapa"),
+                        ("Alcaldía a atender primero", top_alc, "donde hay más señales"),
+                        (
+                            f"Señales en {top_alc}",
+                            f"{top_n}",
+                            "humedades anómalas en esa alcaldía",
+                        ),
                     ],
                     stack=True,
                 ),
@@ -1561,23 +1659,91 @@ def main() -> None:
             )
             hum_view = hum.rename(
                 columns={
-                    "alcaldia": "Alcaldía / municipio",
-                    "humedades_anomalas": "Señales SAR (humedad anómala)",
-                    "score_severidad_max": "Prioridad máx. de inspección",
-                    "nivel_riesgo_estructural": "Riesgo territorial",
-                    "prioridad": "Orden de revisión",
+                    "alcaldia": "Alcaldía",
+                    "humedades_anomalas": "Señales de humedad anómala",
+                    "score_severidad_max": "Prioridad de inspección (0-100)",
+                    "nivel_riesgo_estructural": "Nivel de riesgo",
+                    "prioridad": "Orden sugerido",
                 }
             )
-            chart_df = hum_view.head(8).copy()
-            if "Señales SAR (humedad anómala)" in chart_df.columns:
-                st.bar_chart(
-                    chart_df,
-                    x="Alcaldía / municipio",
-                    y="Señales SAR (humedad anómala)",
-                    horizontal=True,
+            st.markdown("##### Comparativo por alcaldía")
+            st.caption("Color suave = pocas señales · Color intenso = más críticas.")
+            st.markdown(
+                humidity_bars_html(
+                    hum_view,
+                    "Alcaldía",
+                    "Señales de humedad anómala",
+                    top_n=10,
+                ),
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("##### Localizar prioridad de inspección en el mapa")
+            st.markdown(
+                '<div class="z-search-hint">Escribe un número de prioridad (ej. 87) y pulsa Ir al mapa.</div>',
+                unsafe_allow_html=True,
+            )
+            c_q, c_go = st.columns([2.2, 1])
+            with c_q:
+                q_prio = st.text_input(
+                    "Prioridad a localizar",
+                    value="",
+                    placeholder="Ej. 87 o 92",
+                    label_visibility="collapsed",
+                    key="buscar_prioridad_insp",
                 )
-            with st.expander("Tabla detallada por alcaldía", expanded=False):
-                st.dataframe(hum_view, use_container_width=True, hide_index=True, height=280)
+            with c_go:
+                go_prio = st.button("Ir al mapa", use_container_width=True, key="btn_ir_prioridad")
+            if go_prio and str(q_prio).strip():
+                try:
+                    target = float(str(q_prio).strip().replace(",", "."))
+                except Exception:
+                    target = None
+                hit = None
+                pool = salud_map.copy() if len(salud_map) else salud.copy()
+                if target is not None and len(pool) and "score_severidad_fuga" in pool.columns:
+                    pool = pool.copy()
+                    pool["_sc"] = pd.to_numeric(pool["score_severidad_fuga"], errors="coerce")
+                    pool["_d"] = (pool["_sc"] - target).abs()
+                    cand = pool.dropna(subset=["_d", "latitud", "longitud"]).sort_values("_d")
+                    if len(cand) and float(cand.iloc[0]["_d"]) <= 5:
+                        hit = cand.iloc[0]
+                if hit is None and target is not None and len(sar_vista):
+                    try:
+                        s2 = enrich_sar_pfs(sar_vista.copy())
+                    except Exception:
+                        s2 = sar_vista.copy()
+                    sc_col = "pfs" if "pfs" in s2.columns else None
+                    if sc_col and {"latitud", "longitud"}.issubset(s2.columns):
+                        s2 = s2.copy()
+                        s2["_sc"] = pd.to_numeric(s2[sc_col], errors="coerce")
+                        s2["_d"] = (s2["_sc"] - target).abs()
+                        cand = s2.dropna(subset=["_d", "latitud", "longitud"]).sort_values("_d")
+                        if len(cand) and float(cand.iloc[0]["_d"]) <= 5:
+                            hit = cand.iloc[0]
+                if hit is not None:
+                    st.session_state.map_focus = {
+                        "lat": float(hit["latitud"]),
+                        "lon": float(hit["longitud"]),
+                        "zoom": 13.4,
+                    }
+                    lugar = str(hit.get("colonia") or hit.get("alcaldia") or "punto")
+                    st.success(f"Enfocado: prioridad ~{int(hit.get('_sc', target))} · {lugar}")
+                    st.rerun()
+                else:
+                    st.warning("No encontré un punto cercano a esa prioridad en el filtro actual.")
+
+            with st.expander("Detalle por alcaldía", expanded=False):
+                st.dataframe(
+                    paint_priority_table(
+                        hum_view,
+                        score_cols=["Prioridad de inspección (0-100)"],
+                        risk_cols=["Nivel de riesgo"],
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=280,
+                )
         else:
             st.info(
                 "Aún no hay conteo de humedad anómala por alcaldía. "
@@ -1639,37 +1805,36 @@ def main() -> None:
     st.divider()
     st.markdown(
         section_banner(
-            "Inspección municipal · detalle técnico",
-            "Secuencia de venta: 1) prioriza con SAR · 2) valida pozos · 3) contextualiza REPDA · 4) opera flota",
+            "Inspección municipal",
+            "1) Dónde hay humedad anómala · 2) Qué pozos revisar · 3) Qué concesiones hay · 4) Dónde cargar pipas",
         ),
         unsafe_allow_html=True,
     )
     st.markdown(
         explain_box(
-            "<b>Qué le mostramos al cliente:</b> no es un reporte técnico crudo. "
-            "Es la bitácora para decidir <b>dónde abrir inspección</b>, "
-            "<b>qué pozos cruzar</b>, <b>qué presión legal hay (REPDA)</b> y "
-            "<b>cómo responder con pipas</b>."
+            "Bitácora de trabajo con la alcaldía: "
+            "<b>dónde inspeccionar</b>, <b>qué pozos revisar</b>, "
+            "<b>qué concesiones hay</b> y <b>dónde cargar pipas</b>."
         ),
         unsafe_allow_html=True,
     )
 
     tab_sar, tab_pozos, tab_repda, tab_piperos = st.tabs(
-        ["1 · Inspección SAR", "2 · Auditoría de pozos", "3 · Concesiones REPDA", "4 · Módulo piperos"]
+        ["1 · Humedad anómala", "2 · Pozos a revisar", "3 · Concesiones de agua", "4 · Guía para pipas"]
     )
 
     with tab_sar:
         st.markdown(
             section_banner(
-                "Inspección SAR · radar de humedad anómala",
-                "Primero el resumen por alcaldía; después la cola de colonias para mandar brigada.",
+                "Humedad anómala · dónde inspeccionar primero",
+                "Resumen por alcaldía y lista de colonias con mayor urgencia de visita.",
             ),
             unsafe_allow_html=True,
         )
         st.markdown(
             explain_box(
-                "<b>Cómo leer esta pestaña:</b> el color azul→rojo en el score es <b>prioridad de visita</b>, "
-                "no una fuga ya confirmada. Úsalo para armar la ruta de inspección con la alcaldía."
+                "Número alto (rojo) = <b>visitar primero</b>. "
+                "No confirma una fuga: es una alerta para mandar inspección a campo."
             ),
             unsafe_allow_html=True,
         )
@@ -1739,34 +1904,42 @@ def main() -> None:
                 "y asegúrate de haber corrido el ETL SAR."
             )
         if len(salud):
-            st.markdown("##### Cola de brigada · colonias / celdas calientes")
+            st.markdown("##### Colonias a visitar primero")
             st.markdown(
                 explain_box(
-                    "Esto es lo que antes se leía como “score de severidad”. "
-                    "Traducción comercial: <b>lista ordenada de sitios a inspeccionar primero</b>. "
-                    "Cada fila = una colonia/celda candidata a visita de campo."
+                    "Lista de colonias con mayor urgencia de visita. Sirve para armar la ruta de inspección. No mostramos latitud/longitud: el mapa ya ubica el punto."
                 ),
                 unsafe_allow_html=True,
             )
             top = salud.head(25).rename(
                 columns={
-                    "colonia": "Colonia (prioridad de visita)",
+                    "colonia": "Colonia a visitar",
                     "alcaldia": "Alcaldía",
                     "score_severidad_fuga": "Prioridad de inspección (0-100)",
                     "nivel_riesgo_red": "Nivel de riesgo",
-                    "score_sar_humedad": "Señal humedad SAR",
-                    "score_abatimiento": "Estrés de pozo",
-                    "deficit_acui_hm3": "Déficit acuífero hm³",
-                    "fecha_calculo": "Fecha de cálculo",
+                    "score_sar_humedad": "Señal de humedad",
+                    "score_abatimiento": "Estrés del pozo cercano",
+                    "deficit_acui_hm3": "Déficit del acuífero (hm³)",
+                    "fecha_calculo": "Fecha",
                 }
             )
+            drop_geo = [c for c in ("latitud", "longitud", "Latitud", "Longitud", "Lat", "Lon") if c in top.columns]
+            if drop_geo:
+                top = top.drop(columns=drop_geo)
+            keep = [c for c in [
+                "Colonia a visitar", "Alcaldía", "Prioridad de inspección (0-100)",
+                "Nivel de riesgo", "Señal de humedad", "Estrés del pozo cercano",
+                "Déficit del acuífero (hm³)", "Fecha",
+            ] if c in top.columns]
+            if keep:
+                top = top[keep]
             st.dataframe(
                 paint_priority_table(
                     top,
                     score_cols=[
                         "Prioridad de inspección (0-100)",
-                        "Señal humedad SAR",
-                        "Estrés de pozo",
+                        "Señal de humedad",
+                        "Estrés del pozo cercano",
                     ],
                     risk_cols=["Nivel de riesgo"],
                 ),
